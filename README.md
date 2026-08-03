@@ -10,6 +10,11 @@ transparency, tab title and cursor color** — persisted independently of the
 global settings and of the other folders. It applies when a terminal opens in
 that folder, and live when you `cd` into it.
 
+**A rule covers one folder.** Each directory has its own identity and does not
+hand it down: a rule on `~/projects` says nothing about `~/projects/foo`, which
+keeps the global appearance until it gets a rule of its own. Set
+`include_subdirs: true` on a rule when you do want it to cover a whole tree.
+
 A rule only overrides the fields it actually sets. Set a color and nothing else,
 and transparency, title and cursor keep inheriting — including from the global
 settings, so moving the global opacity still moves every folder that did not pin
@@ -30,7 +35,7 @@ immediately):
 {
     1: (path: "~/projects", opacity: Some(85), syntax_theme_dark: Some("Dracula")),
     2: (path: "~/projects/prod", tab_title: Some("PROD"), cursor: Some("#ff0000")),
-    3: (path: "/etc", include_subdirs: false, syntax_theme_dark: Some("Solarized Dark")),
+    3: (path: "/srv", include_subdirs: true, syntax_theme_dark: Some("Solarized Dark")),
 }
 ```
 
@@ -39,7 +44,7 @@ The key is any number, unique per rule. Fields:
 | Field | Default | Meaning |
 |---|---|---|
 | `path` | — | Absolute, or starting with `~`. Required. |
-| `include_subdirs` | `true` | Whether folders below `path` are covered too. |
+| `include_subdirs` | `false` | Opt in to covering everything below `path` too. |
 | `enabled` | `true` | Lets a rule be parked instead of deleted. |
 | `syntax_theme_dark` | inherit | Color scheme name, as shown in *View → Color schemes*. |
 | `syntax_theme_light` | inherit | Same, for light mode. |
@@ -47,9 +52,13 @@ The key is any number, unique per rule. Fields:
 | `tab_title` | inherit | Fixed tab title for the folder. |
 | `cursor` | scheme's | Cursor color, `"#rrggbb"`. |
 
-Nested folders inherit, and **the most specific rule wins**: with the rules
-above, `~/projects/foo` is Dracula at 85%, while `~/projects/prod` is Dracula at
-85% *and* titled `PROD` with a red cursor.
+With the rules above: `~/projects` is Dracula at 85%, `~/projects/prod` is titled
+`PROD` with a red cursor (and *not* Dracula, since rule 1 stops at its own
+folder), and `~/projects/foo` looks like every other folder. Everything under
+`/srv` is Solarized Dark, because rule 3 opted into its subtree.
+
+When rules do overlap — only possible once one opts into a subtree — the most
+specific wins: a folder's own rule beats a tree reaching down into it.
 
 Matching is by path component, not string prefix — a rule on `/home/a` does not
 capture `/home/ab`.

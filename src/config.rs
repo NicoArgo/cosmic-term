@@ -224,6 +224,12 @@ pub struct DirRuleId(pub u64);
 /// An appearance bound to a directory, so a folder can look different from the
 /// rest without touching the global settings.
 ///
+/// **A rule covers one folder.** Each directory carries its own identity and
+/// does not hand it down: a rule on `~/projects` says nothing about
+/// `~/projects/foo`, which keeps the global appearance until it is given a rule
+/// of its own. Covering a whole tree is available per rule via
+/// [`Self::include_subdirs`], but it is opt-in rather than the default.
+///
 /// Every appearance field is an `Option` where `None` means "no opinion,
 /// inherit". That is what keeps folders independent from each other and from
 /// the global settings: a rule that only sets a color leaves opacity, title and
@@ -240,8 +246,8 @@ pub struct DirRule {
     /// which is expanded when the rule is matched (so the config stays portable
     /// between machines with different user names).
     pub path: String,
-    /// Whether the rule also covers directories below `path`. With this off the
-    /// rule only fires on the exact directory.
+    /// Opt in to covering everything below `path` as well. Off by default: a
+    /// folder's appearance is its own, not something its children pick up.
     pub include_subdirs: bool,
     /// Lets a rule be kept but parked, instead of having to delete it.
     pub enabled: bool,
@@ -256,9 +262,9 @@ impl Default for DirRule {
     fn default() -> Self {
         Self {
             path: String::new(),
-            // A rule on `~/projects` covering only `~/projects` itself and none
-            // of the projects inside it would surprise most people.
-            include_subdirs: true,
+            // Each folder has its own identity: painting one must not silently
+            // repaint everything under it.
+            include_subdirs: false,
             enabled: true,
             syntax_theme_dark: None,
             syntax_theme_light: None,
@@ -322,11 +328,14 @@ fn match_depth(rule_path: &Path, cwd: &Path, include_subdirs: bool) -> Option<us
 
 /// The rule that applies to `cwd`, if any.
 ///
-/// The most specific rule wins, measured in path components matched — so a rule
-/// on `~/projects/prod` beats one on `~/projects`, and "exact match beats
-/// inherited-from-parent" falls out of that for free. Ties (only possible
-/// between rules with the same path) go to the lowest id, so the result never
-/// depends on iteration luck.
+/// Normally that is the rule naming this exact directory: folders do not hand
+/// their appearance down to their children. Rules that opted into
+/// [`DirRule::include_subdirs`] can also reach `cwd` from above, and when
+/// several rules reach it the most specific wins — measured in path components
+/// matched, so a subtree rule on `~/projects/prod` beats one on `~/projects`,
+/// and the directory's own rule beats both. Ties (only possible between rules
+/// with the same path) go to the lowest id, so the result never depends on
+/// iteration luck.
 pub fn resolve_dir_rule(rules: &BTreeMap<DirRuleId, DirRule>, cwd: &Path) -> Option<DirRuleId> {
     let mut best: Option<(usize, DirRuleId)> = None;
 
@@ -626,8 +635,33 @@ mod tests {
     }
 
     #[test]
-    fn a_rule_covers_its_subdirectories() {
+    fn a_rule_covers_only_its_own_folder() {
+        // Each folder has its own identity: painting ~/projects must leave the
+        // projects inside it alone.
         let rules = rules(&[(1, rule("/home/nico/projects"))]);
+        assert_eq!(
+            resolve_dir_rule(&rules, Path::new("/home/nico/projects")),
+            Some(DirRuleId(1))
+        );
+        assert_eq!(
+            resolve_dir_rule(&rules, Path::new("/home/nico/projects/foo")),
+            None
+        );
+        assert_eq!(
+            resolve_dir_rule(&rules, Path::new("/home/nico/projects/foo/bar")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_rule_can_opt_into_covering_its_subtree() {
+        let rules = rules(&[(
+            1,
+            DirRule {
+                include_subdirs: true,
+                ..rule("/home/nico/projects")
+            },
+        )]);
         assert_eq!(
             resolve_dir_rule(&rules, Path::new("/home/nico/projects/foo/bar")),
             Some(DirRuleId(1))
@@ -635,19 +669,32 @@ mod tests {
     }
 
     #[test]
-    fn the_most_specific_rule_wins() {
-        // The whole point of nesting: a rule deeper in the tree must override
-        // the one it sits inside, no matter what order they are stored in.
+    fn a_folders_own_rule_beats_a_subtree_reaching_it() {
+        // Only reachable once someone opts into subtrees: the folder's own
+        // identity must still win over the tree it happens to sit in.
         let rules = rules(&[
-            (1, rule("/home/nico/projects")),
+            (
+                1,
+                DirRule {
+                    include_subdirs: true,
+                    ..rule("/home/nico/projects")
+                },
+            ),
             (2, rule("/home/nico/projects/prod")),
         ]);
         assert_eq!(
-            resolve_dir_rule(&rules, Path::new("/home/nico/projects/prod/src")),
+            resolve_dir_rule(&rules, Path::new("/home/nico/projects/prod")),
             Some(DirRuleId(2))
         );
+        // And a folder with no rule of its own falls to the subtree rule.
         assert_eq!(
             resolve_dir_rule(&rules, Path::new("/home/nico/projects/dev")),
+            Some(DirRuleId(1))
+        );
+        // The deeper rule does not cover a subtree, so its children are the
+        // outer tree's again.
+        assert_eq!(
+            resolve_dir_rule(&rules, Path::new("/home/nico/projects/prod/src")),
             Some(DirRuleId(1))
         );
     }
@@ -665,25 +712,6 @@ mod tests {
     }
 
     #[test]
-    fn subdirectories_can_be_excluded() {
-        let rules = rules(&[(
-            1,
-            DirRule {
-                include_subdirs: false,
-                ..rule("/home/nico/projects")
-            },
-        )]);
-        assert_eq!(
-            resolve_dir_rule(&rules, Path::new("/home/nico/projects")),
-            Some(DirRuleId(1))
-        );
-        assert_eq!(
-            resolve_dir_rule(&rules, Path::new("/home/nico/projects/foo")),
-            None
-        );
-    }
-
-    #[test]
     fn a_disabled_rule_never_matches() {
         let rules = rules(&[(
             1,
@@ -697,10 +725,16 @@ mod tests {
 
     #[test]
     fn a_parked_rule_does_not_shadow_a_live_one() {
-        // Disabling the deeper rule has to hand the directory back to the
-        // shallower one, not leave it unmatched.
+        // Disabling a folder's own rule has to hand it back to the subtree rule
+        // reaching it, not leave it unmatched.
         let rules = rules(&[
-            (1, rule("/home/nico")),
+            (
+                1,
+                DirRule {
+                    include_subdirs: true,
+                    ..rule("/home/nico")
+                },
+            ),
             (
                 2,
                 DirRule {
@@ -740,7 +774,7 @@ mod tests {
         };
         let rules = rules(&[(1, rule("~/projects"))]);
         assert_eq!(
-            resolve_dir_rule(&rules, &home.join("projects/foo")),
+            resolve_dir_rule(&rules, &home.join("projects")),
             Some(DirRuleId(1))
         );
     }
@@ -826,12 +860,13 @@ mod tests {
 
     #[test]
     fn the_documented_example_parses() {
-        // The snippet the ROADMAP tells people to type. If this drifts, the
-        // documented way to try the feature stops working.
+        // The snippet README.md tells people to type. If this drifts, the only
+        // documented way to use the feature today stops working.
         let written: BTreeMap<DirRuleId, DirRule> = ron::from_str(
             r##"{
-                1: (path: "~/projetos", opacity: Some(85), syntax_theme_dark: Some("Dracula")),
-                2: (path: "~/projetos/prod", tab_title: Some("PROD"), cursor: Some("#ff0000")),
+                1: (path: "~/projects", opacity: Some(85), syntax_theme_dark: Some("Dracula")),
+                2: (path: "~/projects/prod", tab_title: Some("PROD"), cursor: Some("#ff0000")),
+                3: (path: "/srv", include_subdirs: true, syntax_theme_dark: Some("Solarized Dark")),
             }"##,
         )
         .expect("the example in the docs must parse");
@@ -840,6 +875,20 @@ mod tests {
         assert_eq!(
             written[&DirRuleId(2)].cursor,
             Some(HexColor::rgb(0xff, 0x00, 0x00))
+        );
+        assert!(written[&DirRuleId(3)].include_subdirs);
+
+        // And the documented outcome holds: rule 1 stops at its own folder.
+        let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("/home/nobody"));
+        assert_eq!(
+            resolve_dir_rule(&written, &home.join("projects/foo")),
+            None,
+            "a folder without a rule must keep the global appearance"
+        );
+        assert_eq!(
+            resolve_dir_rule(&written, Path::new("/srv/anything/deep")),
+            Some(DirRuleId(3)),
+            "the subtree rule must reach down"
         );
     }
 
@@ -860,8 +909,8 @@ mod tests {
         assert_eq!(rule.opacity, Some(85));
         assert!(rule.enabled, "a rule must be live unless it says otherwise");
         assert!(
-            rule.include_subdirs,
-            "subdirectories must be covered by default"
+            !rule.include_subdirs,
+            "a folder's appearance must not spread to its children by default"
         );
         assert_eq!(rule.syntax_theme_dark, None);
         assert_eq!(rule.cursor, None);
