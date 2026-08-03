@@ -47,7 +47,7 @@ use tokio::sync::mpsc;
 
 use config::{
     AppTheme, CONFIG_VERSION, ColorScheme, ColorSchemeId, ColorSchemeKind, Config, Profile,
-    ProfileId,
+    ProfileId, resolve_dir_rule,
 };
 mod config;
 mod mouse_reporter;
@@ -1621,6 +1621,28 @@ impl App {
                                 (options, None)
                             };
 
+                            // The rule for the directory this terminal starts
+                            // in. When the shell just inherits the process cwd
+                            // there is nothing to resolve from here; the live
+                            // check picks the folder up on the first prompt.
+                            let dir_rule_id_opt = options
+                                .working_directory
+                                .as_deref()
+                                .and_then(|cwd| resolve_dir_rule(&self.config.dir_rules, cwd));
+
+                            // A rule's title outranks the profile's, and
+                            // effective_appearance already layers the two, so
+                            // this replaces the profile-only value above.
+                            let tab_title_override = self
+                                .config
+                                .effective_appearance(
+                                    color_scheme_kind,
+                                    profile_id_opt,
+                                    dir_rule_id_opt,
+                                )
+                                .tab_title
+                                .or(tab_title_override);
+
                             let entity = tab_model
                                 .insert()
                                 .text(
@@ -1640,6 +1662,7 @@ impl App {
                                 &self.config,
                                 *colors,
                                 profile_id_opt,
+                                dir_rule_id_opt,
                                 tab_title_override,
                             ) {
                                 Ok(mut terminal) => {
@@ -3498,6 +3521,9 @@ impl Application for App {
                 .cloned()
                 .unwrap_or_else(widget::Id::unique);
             if let Some(terminal) = tab_model.data::<Mutex<Terminal>>(entity) {
+                // Read the rule before handing the terminal to the widget, so
+                // this lock is released before the widget takes its own.
+                let dir_rule_id_opt = terminal.lock().unwrap().dir_rule_id_opt;
                 let mut terminal_box = terminal_box(terminal, &self.key_binds)
                     .id(terminal_id)
                     .disabled(self.core.window.show_context)
@@ -3506,11 +3532,12 @@ impl Application for App {
                     .on_open_hyperlink(Some(Box::new(Message::LaunchUrl)))
                     .on_window_focused(|| Message::WindowFocused)
                     .on_window_unfocused(|| Message::WindowUnfocused)
-                    .opacity(if t.transparent {
-                        t.cosmic().alpha_map.blurred_alpha(t.cosmic().frosted)
-                    } else {
-                        self.config.opacity_ratio()
-                    })
+                    .opacity(terminal_opacity(
+                        self.config.dir_rule_opacity(dir_rule_id_opt),
+                        t.transparent,
+                        || t.cosmic().alpha_map.blurred_alpha(t.cosmic().frosted),
+                        || self.config.opacity_ratio(),
+                    ))
                     .padding(space_xxs)
                     .sharp_corners(self.core.window.sharp_corners)
                     .show_headerbar(self.config.show_headerbar)
@@ -3747,6 +3774,25 @@ fn pane_divider_color(
     cosmic.background(transparent).divider
 }
 
+/// Alpha to render a terminal pane with.
+///
+/// A directory rule is an explicit choice about one folder, so it wins even
+/// under blur — otherwise the theme dictates the alpha and pinning a folder's
+/// transparency would silently do nothing. With no rule this is exactly the
+/// behaviour from before per-directory appearance existed.
+fn terminal_opacity(
+    dir_rule_opacity: Option<u8>,
+    transparent: bool,
+    blurred_alpha: impl FnOnce() -> f32,
+    global_ratio: impl FnOnce() -> f32,
+) -> f32 {
+    match dir_rule_opacity {
+        Some(opacity) => f32::from(opacity) / 100.0,
+        None if transparent => blurred_alpha(),
+        None => global_ratio(),
+    }
+}
+
 /// Border stroke drawn around each terminal pane.
 ///
 /// The stroke sits on the pane edge rather than behind it, so the pane
@@ -3765,7 +3811,23 @@ fn pane_border(cosmic: &cosmic_theme::Theme, transparent: bool, show: bool) -> i
 
 #[cfg(test)]
 mod tests {
-    use super::{pane_border, pane_divider_color};
+    use super::{pane_border, pane_divider_color, terminal_opacity};
+
+    #[test]
+    fn a_folders_pinned_opacity_survives_blur() {
+        // The trap this guards: blur replaces the pane alpha with a theme
+        // constant, so without this a folder pinned to fully opaque would still
+        // render translucent and the setting would look broken.
+        assert_eq!(terminal_opacity(Some(100), true, || 0.3, || 0.8), 1.0);
+        assert_eq!(terminal_opacity(Some(50), false, || 0.3, || 0.8), 0.5);
+    }
+
+    #[test]
+    fn without_a_rule_opacity_is_untouched() {
+        // No rule must mean byte-identical behaviour to before the feature.
+        assert_eq!(terminal_opacity(None, true, || 0.3, || 0.8), 0.3);
+        assert_eq!(terminal_opacity(None, false, || 0.3, || 0.8), 0.8);
+    }
 
     #[test]
     fn pane_border_is_drawn_only_when_enabled() {

@@ -40,7 +40,7 @@ use tokio::sync::mpsc;
 pub use alacritty_terminal::grid::Scroll as TerminalScroll;
 
 use crate::{
-    config::{ColorSchemeKind, Config as AppConfig, ProfileId},
+    config::{ColorSchemeKind, Config as AppConfig, DirRuleId, ProfileId},
     menu::MenuState,
     mouse_reporter::MouseReporter,
 };
@@ -241,6 +241,10 @@ pub struct Terminal {
     pub metadata_set: IndexSet<Metadata>,
     pub needs_update: bool,
     pub profile_id_opt: Option<ProfileId>,
+    /// Directory rule currently applying to this terminal, resolved from its
+    /// working directory. `None` means the folder has no rule and the terminal
+    /// looks exactly as it did before this feature existed.
+    pub dir_rule_id_opt: Option<DirRuleId>,
     pub tab_title_override: Option<String>,
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     pub url_regex_search: RegexSearch,
@@ -275,6 +279,7 @@ impl Terminal {
         app_config: &AppConfig,
         colors: Colors,
         profile_id_opt: Option<ProfileId>,
+        dir_rule_id_opt: Option<DirRuleId>,
         tab_title_override: Option<String>,
     ) -> Result<Self, io::Error> {
         let font_stretch = app_config.typed_font_stretch();
@@ -356,6 +361,7 @@ impl Terminal {
             needs_update: true,
             notifier,
             profile_id_opt,
+            dir_rule_id_opt,
             search_regex_opt: None,
             search_value: String::new(),
             shell_pid,
@@ -685,13 +691,29 @@ impl Terminal {
             update_cell_size = true;
         }
 
-        if let Some(colors) =
-            themes.get(&config.syntax_theme(color_scheme_kind, self.profile_id_opt))
-        {
+        let appearance = config.effective_appearance(
+            color_scheme_kind,
+            self.profile_id_opt,
+            self.dir_rule_id_opt,
+        );
+
+        if let Some(colors) = themes.get(&(appearance.syntax_theme, color_scheme_kind)) {
+            // Build the target first, so that a cursor pinned by a directory
+            // rule takes part in the change detection below instead of being
+            // painted on afterwards and never noticed.
+            let mut target = *colors;
+            if let Some(cursor) = appearance.cursor {
+                target[NamedColor::Cursor] = Some(Rgb {
+                    r: cursor.r,
+                    g: cursor.g,
+                    b: cursor.b,
+                });
+            }
+
             let mut changed = false;
             for i in 0..color::COUNT {
-                if self.colors[i] != colors[i] {
-                    self.colors[i] = colors[i];
+                if self.colors[i] != target[i] {
+                    self.colors[i] = target[i];
                     changed = true;
                 }
             }
@@ -699,6 +721,11 @@ impl Terminal {
                 update = true;
             }
         }
+
+        // A directory rule's tab title outranks the profile's, so it has to be
+        // re-resolved here rather than only at creation — the rule can change
+        // under a terminal that is already open.
+        self.tab_title_override = appearance.tab_title;
 
         // NOTE: this is done on every set_config because the changed boolean above does not capture
         // WINDOW_BG changes

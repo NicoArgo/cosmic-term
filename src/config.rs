@@ -538,6 +538,24 @@ impl Config {
     /// Field by field is the point: a rule that only pins a color must not drag
     /// the other three along with it, otherwise every rule would silently
     /// freeze the whole appearance of its folder.
+    /// The opacity a directory rule pins for this folder, if it pins one.
+    ///
+    /// Kept separate from [`Self::effective_appearance`] because the view needs
+    /// to tell "this folder asked for 85%" apart from "nobody asked, use the
+    /// global 85%" — under blur those two must behave differently.
+    pub fn dir_rule_opacity(&self, dir_rule_id_opt: Option<DirRuleId>) -> Option<u8> {
+        dir_rule_id_opt
+            .and_then(|id| self.dir_rules.get(&id))
+            .and_then(|rule| rule.opacity)
+    }
+
+    /// Opacity for a terminal: the directory rule's if it has one, else the
+    /// global. Profiles carry no opacity of their own.
+    pub fn effective_opacity(&self, dir_rule_id_opt: Option<DirRuleId>) -> u8 {
+        self.dir_rule_opacity(dir_rule_id_opt)
+            .unwrap_or(self.opacity)
+    }
+
     pub fn effective_appearance(
         &self,
         color_scheme_kind: ColorSchemeKind,
@@ -557,9 +575,7 @@ impl Config {
             // is the only layer left to add on top.
             syntax_theme: rule_theme
                 .unwrap_or_else(|| self.syntax_theme(color_scheme_kind, profile_id_opt).0),
-            // Profiles carry no opacity of their own, so this falls straight
-            // through to the global value.
-            opacity: rule_opt.and_then(|rule| rule.opacity).unwrap_or(self.opacity),
+            opacity: self.effective_opacity(dir_rule_id_opt),
             tab_title: rule_opt
                 .and_then(|rule| rule.tab_title.clone())
                 .or_else(|| {
@@ -806,6 +822,57 @@ mod tests {
         assert_eq!(appearance.opacity, 75);
         assert_eq!(appearance.tab_title, None);
         assert_eq!(appearance.cursor, None);
+    }
+
+    #[test]
+    fn a_pinned_opacity_is_distinguishable_from_an_inherited_one() {
+        // The view needs to tell "this folder asked for 90%" apart from
+        // "nobody asked, the global happens to be 90%", because blur treats
+        // those two differently.
+        let mut config = Config::default();
+        config.opacity = 90;
+        config.dir_rules.insert(
+            DirRuleId(1),
+            DirRule {
+                opacity: Some(90),
+                ..rule("/home/nico/pinned")
+            },
+        );
+        config
+            .dir_rules
+            .insert(DirRuleId(2), rule("/home/nico/plain"));
+
+        assert_eq!(config.dir_rule_opacity(Some(DirRuleId(1))), Some(90));
+        assert_eq!(config.dir_rule_opacity(Some(DirRuleId(2))), None);
+        assert_eq!(config.dir_rule_opacity(None), None);
+
+        // Either way the effective value is the same 90.
+        assert_eq!(config.effective_opacity(Some(DirRuleId(1))), 90);
+        assert_eq!(config.effective_opacity(Some(DirRuleId(2))), 90);
+        assert_eq!(config.effective_opacity(None), 90);
+    }
+
+    #[test]
+    fn a_rule_can_pin_a_cursor_color() {
+        let mut config = Config::default();
+        config.dir_rules.insert(
+            DirRuleId(1),
+            DirRule {
+                cursor: Some(HexColor::rgb(0xff, 0x00, 0x00)),
+                ..rule("/home/nico")
+            },
+        );
+
+        let appearance =
+            config.effective_appearance(ColorSchemeKind::Dark, None, Some(DirRuleId(1)));
+        assert_eq!(appearance.cursor, Some(HexColor::rgb(0xff, 0x00, 0x00)));
+        // And a terminal with no rule keeps whatever its scheme says.
+        assert_eq!(
+            config
+                .effective_appearance(ColorSchemeKind::Dark, None, None)
+                .cursor,
+            None
+        );
     }
 
     #[test]
