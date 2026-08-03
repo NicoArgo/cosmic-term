@@ -20,6 +20,25 @@ delete = Excluir
 import = Importar
 import-errors = Erros de Importação
 
+## Directory rules
+
+directory-rules = Regras por pasta...
+directory-rules-description = Dê a uma pasta a sua própria aparência. A regra vale para aquela pasta — as de dentro dela seguem com a aparência global até ganharem regra própria.
+add-rule = Adicionar regra
+rule-path = Pasta
+rule-path-unset = (nenhuma pasta definida)
+rule-enabled = Ativa
+use-current-directory = Usar a pasta atual
+include-subdirectories = Incluir subpastas
+include-subdirectories-description = Cobrir também tudo o que estiver abaixo desta pasta
+inherit = Herdar
+pin-opacity = Fixar transparência
+pin-opacity-description = Sem isso, a pasta segue o ajuste global
+rule-cursor-color = Cor do cursor
+rule-cursor-color-description = Deixe vazio para usar o cursor do esquema de cores
+use-appearance-here = Usar esta aparência aqui
+remove-rule-here = Remover a regra desta pasta
+
 ## Profiles
 
 profiles = Perfis

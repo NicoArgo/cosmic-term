@@ -35,6 +35,9 @@ pub fn context_menu<'a>(
     key_binds: &HashMap<KeyBind, Action>,
     entity: segmented_button::Entity,
     link: Option<String>,
+    // Whether this terminal's folder already has a rule, so the menu can offer
+    // removing it only when there is something to remove.
+    has_dir_rule: bool,
 ) -> Element<'a, Message> {
     let find_key = |action: &Action| -> String {
         for (key_bind, key_action) in key_binds {
@@ -94,9 +97,24 @@ pub fn context_menu<'a>(
             Action::PaneToggleMaximized,
         )),
         Element::from(divider::horizontal::light()),
+        // The quick way to give the folder you are standing in its own look,
+        // without going through the rules page at all.
+        Element::from(menu_item(
+            fl!("use-appearance-here"),
+            Action::DirRuleSaveHere,
+        )),
+    ];
+    if has_dir_rule {
+        rows.push(Element::from(menu_item(
+            fl!("remove-rule-here"),
+            Action::DirRuleRemoveHere,
+        )));
+    }
+    rows.extend([
+        Element::from(divider::horizontal::light()),
         Element::from(menu_item(fl!("new-tab"), Action::TabNew)),
         Element::from(menu_item(fl!("menu-settings"), Action::Settings)),
-    ];
+    ]);
     #[cfg(feature = "password_manager")]
     {
         rows.push(Element::from(menu_item(
@@ -227,6 +245,7 @@ pub fn menu_bar<'a>(
                         MenuItem::Divider,
                         MenuItem::Folder(fl!("profile"), profile_items),
                         MenuItem::Button(fl!("menu-profiles"), None, Action::Profiles),
+                        MenuItem::Button(fl!("directory-rules"), None, Action::DirectoryRules),
                         MenuItem::Divider,
                         MenuItem::Button(fl!("close-tab"), None, Action::TabClose),
                         MenuItem::Divider,

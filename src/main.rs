@@ -45,9 +45,11 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+use hex_color::HexColor;
+
 use config::{
-    AppTheme, CONFIG_VERSION, ColorScheme, ColorSchemeId, ColorSchemeKind, Config, Profile,
-    ProfileId, resolve_dir_rule,
+    AppTheme, CONFIG_VERSION, ColorScheme, ColorSchemeId, ColorSchemeKind, Config, DirRuleId,
+    Profile, ProfileId, resolve_dir_rule,
 };
 mod config;
 mod mouse_reporter;
@@ -246,6 +248,9 @@ pub enum Action {
     ColorSchemes(ColorSchemeKind),
     Copy,
     CopyUrlByMenu,
+    DirectoryRules,
+    DirRuleSaveHere,
+    DirRuleRemoveHere,
     CopyOrSigint,
     CopyPrimary,
     Find,
@@ -315,6 +320,9 @@ impl Action {
             Self::PasswordManager => Message::ToggleContextPage(ContextPage::PasswordManager),
             Self::Paste => Message::Paste(entity_opt),
             Self::PastePrimary => Message::PastePrimary(entity_opt),
+            Self::DirectoryRules => Message::ToggleContextPage(ContextPage::DirectoryRules),
+            Self::DirRuleSaveHere => Message::DirRuleSaveHere(entity_opt),
+            Self::DirRuleRemoveHere => Message::DirRuleRemoveHere(entity_opt),
             Self::ProfileOpen(profile_id) => Message::ProfileOpen(*profile_id),
             Self::Profiles => Message::ToggleContextPage(ContextPage::Profiles),
             Self::SelectAll => Message::SelectAll(entity_opt),
@@ -413,6 +421,23 @@ pub enum Message {
     Paste(Option<segmented_button::Entity>),
     PastePrimary(Option<segmented_button::Entity>),
     PasteValue(Option<segmented_button::Entity>, String),
+    DirRuleCollapse(DirRuleId),
+    DirRuleCursor(DirRuleId, String),
+    DirRuleEnabled(DirRuleId, bool),
+    DirRuleExpand(DirRuleId),
+    DirRuleIncludeSubdirs(DirRuleId, bool),
+    DirRuleNew,
+    DirRuleOpacity(DirRuleId, u8),
+    DirRuleOpacityPinned(DirRuleId, bool),
+    DirRulePath(DirRuleId, String),
+    DirRuleRemove(DirRuleId),
+    /// Pin the active terminal's current appearance to the folder it is in.
+    DirRuleSaveHere(Option<segmented_button::Entity>),
+    /// Drop the rule covering the active terminal's folder.
+    DirRuleRemoveHere(Option<segmented_button::Entity>),
+    DirRuleSyntaxTheme(DirRuleId, ColorSchemeKind, usize),
+    DirRuleTabTitle(DirRuleId, String),
+    DirRuleUseCurrentDirectory(DirRuleId),
     ProfileCollapse(ProfileId),
     ProfileCommand(ProfileId, String),
     ProfileDirectory(ProfileId, String),
@@ -462,6 +487,7 @@ pub enum Message {
 pub enum ContextPage {
     About,
     ColorSchemes(ColorSchemeKind),
+    DirectoryRules,
     KeyboardShortcuts,
     Profiles,
     Settings,
@@ -500,6 +526,16 @@ pub struct App {
     zoom_steps: Vec<u16>,
     theme_names_dark: Vec<String>,
     theme_names_light: Vec<String>,
+    /// The same lists with an "inherit" entry at index 0, for directory rules —
+    /// where "no opinion" is a real choice and needs to be pickable.
+    theme_names_dark_or_inherit: Vec<String>,
+    theme_names_light_or_inherit: Vec<String>,
+    /// Rule currently expanded in the directory-rules page.
+    dir_rule_expanded: Option<DirRuleId>,
+    /// In-progress text of the expanded rule's cursor field. Kept apart from the
+    /// rule so a half-typed color (`#f`) can sit in the box without being
+    /// rejected or committed.
+    dir_rule_cursor_text: String,
     themes: HashMap<(String, ColorSchemeKind), TermColors>,
     context_page: ContextPage,
     dialog_opt: Option<Dialog<Message>>,
@@ -589,6 +625,16 @@ impl App {
             .sort_by(|a, b| LANGUAGE_SORTER.compare(a, b));
         self.theme_names_light
             .sort_by(|a, b| LANGUAGE_SORTER.compare(a, b));
+
+        // Index 0 is "inherit", so a directory rule can say "no opinion about
+        // the color scheme" as a first-class choice rather than by clearing
+        // something.
+        self.theme_names_dark_or_inherit = std::iter::once(fl!("inherit"))
+            .chain(self.theme_names_dark.iter().cloned())
+            .collect();
+        self.theme_names_light_or_inherit = std::iter::once(fl!("inherit"))
+            .chain(self.theme_names_light.iter().cloned())
+            .collect();
     }
 
     fn reset_terminal_panes_zoom(&mut self) {
@@ -756,6 +802,58 @@ impl App {
         }
         self.update_color_schemes();
         Task::none()
+    }
+
+    /// Re-resolve every open terminal's rule and restyle it.
+    ///
+    /// Editing a rule can change *which* rule owns a directory, not just how it
+    /// looks, so re-resolving has to happen before restyling. Uses each
+    /// terminal's cached directory, so this costs no I/O.
+    fn reapply_dir_rules(&mut self) {
+        let color_scheme_kind = self.config.color_scheme_kind(self.core.system_theme());
+        for (_pane, tab_model) in self.pane_model.panes.iter() {
+            for entity in tab_model.iter() {
+                if let Some(terminal) = tab_model.data::<Mutex<Terminal>>(entity) {
+                    let mut terminal = terminal.lock().unwrap();
+                    terminal.dir_rule_id_opt = terminal
+                        .polled_working_directory()
+                        .and_then(|cwd| resolve_dir_rule(&self.config.dir_rules, cwd));
+                    terminal.set_config(&self.config, color_scheme_kind, &self.themes);
+                }
+            }
+        }
+    }
+
+    fn save_dir_rules(&mut self) -> Task<Message> {
+        if let Some(ref config_handler) = self.config_handler
+            && let Err(err) = config_handler.set("dir_rules", &self.config.dir_rules)
+        {
+            log::error!("failed to save config: {}", err);
+        }
+        // Apply immediately: editing a rule with the folder open should show up
+        // without waiting for the next prompt.
+        self.reapply_dir_rules();
+        Task::none()
+    }
+
+    /// Whether the folder a terminal is in already has a rule naming it. Drives
+    /// whether the context menu offers to remove one.
+    fn terminal_has_dir_rule(&self, entity_opt: Option<segmented_button::Entity>) -> bool {
+        self.terminal_working_directory(entity_opt)
+            .is_some_and(|cwd| self.config.dir_rule_for_exact_path(&cwd).is_some())
+    }
+
+    /// The working directory of a terminal, for the "here" actions and for
+    /// prefilling a rule's path.
+    fn terminal_working_directory(
+        &self,
+        entity_opt: Option<segmented_button::Entity>,
+    ) -> Option<PathBuf> {
+        let tab_model = self.pane_model.active()?;
+        let entity = entity_opt.unwrap_or_else(|| tab_model.active());
+        let terminal = tab_model.data::<Mutex<Terminal>>(entity)?;
+        let terminal = terminal.lock().unwrap();
+        terminal.working_directory()
     }
 
     fn save_profiles(&mut self) -> Task<Message> {
@@ -1135,6 +1233,204 @@ impl App {
         }
 
         widget::settings::view_column(groups).into()
+    }
+
+    fn directory_rules(&self) -> Element<'_, Message> {
+        let cosmic_theme::Spacing {
+            space_s,
+            space_xs,
+            space_xxs,
+            space_xxxs,
+            ..
+        } = self.core().system_theme().cosmic().spacing;
+
+        let mut sections = Vec::with_capacity(3);
+
+        sections.push(
+            widget::text::body(fl!("directory-rules-description"))
+                .apply(widget::container)
+                .padding([0, space_s])
+                .into(),
+        );
+
+        if !self.config.dir_rules.is_empty() {
+            let mut rules_section = widget::settings::section();
+            for (rule_path, dir_rule_id) in self.config.dir_rule_paths() {
+                let Some(rule) = self.config.dir_rules.get(&dir_rule_id) else {
+                    continue;
+                };
+
+                let expanded = self.dir_rule_expanded == Some(dir_rule_id);
+                let label = if rule_path.is_empty() {
+                    fl!("rule-path-unset")
+                } else {
+                    rule_path
+                };
+
+                rules_section = rules_section.add(
+                    widget::settings::item::builder(label).control(
+                        widget::row::with_children(vec![
+                            widget::button::custom(icon_cache_get("edit-delete-symbolic", 16))
+                                .on_press(Message::DirRuleRemove(dir_rule_id))
+                                .class(style::Button::Icon)
+                                .into(),
+                            if expanded {
+                                widget::button::custom(icon_cache_get("go-up-symbolic", 16))
+                                    .on_press(Message::DirRuleCollapse(dir_rule_id))
+                            } else {
+                                widget::button::custom(icon_cache_get("go-down-symbolic", 16))
+                                    .on_press(Message::DirRuleExpand(dir_rule_id))
+                            }
+                            .class(style::Button::Icon)
+                            .into(),
+                        ])
+                        .align_y(Alignment::Center)
+                        .spacing(space_xxs),
+                    ),
+                );
+
+                if expanded {
+                    // Index 0 is "inherit", so an unset scheme selects the first
+                    // entry rather than showing an empty dropdown.
+                    let dark_selected = Some(rule.syntax_theme_dark.as_ref().map_or(0, |name| {
+                        self.theme_names_dark
+                            .iter()
+                            .position(|n| n == name)
+                            .map_or(0, |i| i + 1)
+                    }));
+                    let light_selected = Some(rule.syntax_theme_light.as_ref().map_or(0, |name| {
+                        self.theme_names_light
+                            .iter()
+                            .position(|n| n == name)
+                            .map_or(0, |i| i + 1)
+                    }));
+
+                    let mut expanded_section = widget::settings::section()
+                        .add(
+                            widget::column::with_children(vec![
+                                widget::text(fl!("rule-path")).into(),
+                                widget::text_input("", &rule.path)
+                                    .on_input(move |text| Message::DirRulePath(dir_rule_id, text))
+                                    .on_paste(move |text| Message::DirRulePath(dir_rule_id, text))
+                                    .into(),
+                                widget::button::standard(fl!("use-current-directory"))
+                                    .on_press(Message::DirRuleUseCurrentDirectory(dir_rule_id))
+                                    .into(),
+                            ])
+                            .spacing(space_xxxs)
+                            .padding([0, space_s]),
+                        )
+                        .add(
+                            widget::settings::item::builder(fl!("rule-enabled")).control(
+                                widget::toggler(rule.enabled).on_toggle(move |value| {
+                                    Message::DirRuleEnabled(dir_rule_id, value)
+                                }),
+                            ),
+                        )
+                        .add(
+                            widget::settings::item::builder(fl!("include-subdirectories"))
+                                .description(fl!("include-subdirectories-description"))
+                                .control(widget::toggler(rule.include_subdirs).on_toggle(
+                                    move |value| Message::DirRuleIncludeSubdirs(dir_rule_id, value),
+                                )),
+                        )
+                        .add(
+                            widget::settings::item::builder(fl!("syntax-dark")).control(
+                                widget::dropdown::popup_dropdown(
+                                    &self.theme_names_dark_or_inherit,
+                                    dark_selected,
+                                    move |theme_i| {
+                                        Message::DirRuleSyntaxTheme(
+                                            dir_rule_id,
+                                            ColorSchemeKind::Dark,
+                                            theme_i,
+                                        )
+                                    },
+                                    self.core.main_window_id().unwrap_or(window::Id::RESERVED),
+                                    Message::Surface,
+                                    |a| a,
+                                ),
+                            ),
+                        )
+                        .add(
+                            widget::settings::item::builder(fl!("syntax-light")).control(
+                                widget::dropdown(
+                                    &self.theme_names_light_or_inherit,
+                                    light_selected,
+                                    move |theme_i| {
+                                        Message::DirRuleSyntaxTheme(
+                                            dir_rule_id,
+                                            ColorSchemeKind::Light,
+                                            theme_i,
+                                        )
+                                    },
+                                ),
+                            ),
+                        )
+                        .add(
+                            widget::settings::item::builder(fl!("pin-opacity"))
+                                .description(fl!("pin-opacity-description"))
+                                .control(widget::toggler(rule.opacity.is_some()).on_toggle(
+                                    move |value| Message::DirRuleOpacityPinned(dir_rule_id, value),
+                                )),
+                        );
+
+                    // Only worth showing once the folder actually pins one.
+                    if let Some(opacity) = rule.opacity {
+                        expanded_section = expanded_section.add(
+                            widget::settings::item::builder(fl!("opacity"))
+                                .description(format!("{opacity}%"))
+                                .control(widget::slider(0..=100, opacity, move |value| {
+                                    Message::DirRuleOpacity(dir_rule_id, value)
+                                })),
+                        );
+                    }
+
+                    expanded_section = expanded_section.add(
+                        widget::column::with_children(vec![
+                            widget::text(fl!("tab-title")).into(),
+                            widget::text_input(
+                                fl!("inherit"),
+                                rule.tab_title.as_deref().unwrap_or(""),
+                            )
+                            .on_input(move |text| Message::DirRuleTabTitle(dir_rule_id, text))
+                            .on_paste(move |text| Message::DirRuleTabTitle(dir_rule_id, text))
+                            .into(),
+                            widget::text(fl!("rule-cursor-color")).into(),
+                            widget::text_input("#rrggbb", &self.dir_rule_cursor_text)
+                                .on_input(move |text| Message::DirRuleCursor(dir_rule_id, text))
+                                .on_paste(move |text| Message::DirRuleCursor(dir_rule_id, text))
+                                .into(),
+                            widget::text::caption(fl!("rule-cursor-color-description")).into(),
+                        ])
+                        .spacing(space_xxxs)
+                        .padding([0, space_s]),
+                    );
+
+                    let padding = Padding {
+                        top: 0.0,
+                        bottom: 0.0,
+                        left: space_s.into(),
+                        right: space_s.into(),
+                    };
+                    rules_section =
+                        rules_section.add(widget::container(expanded_section).padding(padding));
+                }
+            }
+            sections.push(rules_section.into());
+        }
+
+        let add_rule = widget::row::with_children(vec![
+            widget::space::horizontal().into(),
+            widget::button::standard(fl!("add-rule"))
+                .on_press(Message::DirRuleNew)
+                .into(),
+        ]);
+        sections.push(add_rule.into());
+
+        widget::settings::view_column(sections)
+            .spacing(space_xs)
+            .into()
     }
 
     fn profiles(&self) -> Element<'_, Message> {
@@ -1962,6 +2258,10 @@ impl Application for App {
             zoom_steps,
             theme_names_dark: Vec::new(),
             theme_names_light: Vec::new(),
+            theme_names_dark_or_inherit: Vec::new(),
+            theme_names_light_or_inherit: Vec::new(),
+            dir_rule_expanded: None,
+            dir_rule_cursor_text: String::new(),
             themes: HashMap::new(),
             context_page: ContextPage::Settings,
             dialog_opt: None,
@@ -2784,6 +3084,179 @@ impl Application for App {
                     return self.save_profiles();
                 }
             }
+            Message::DirRuleCollapse(_dir_rule_id) => {
+                self.dir_rule_expanded = None;
+            }
+            Message::DirRuleExpand(dir_rule_id) => {
+                self.dir_rule_expanded = Some(dir_rule_id);
+                // Seed the editing buffer from the rule, so the box shows what
+                // is stored rather than whatever was typed for another rule.
+                self.dir_rule_cursor_text = self
+                    .config
+                    .dir_rules
+                    .get(&dir_rule_id)
+                    .and_then(|rule| rule.cursor)
+                    .map(|cursor| cursor.display_rgb().to_string())
+                    .unwrap_or_default();
+            }
+            Message::DirRuleNew => {
+                let dir_rule_id = self.config.next_dir_rule_id();
+                // Prefill with where the user is: a rule for "nowhere" is never
+                // what someone wants, and typing a path by hand is the tedious
+                // part of making one.
+                let path = self
+                    .terminal_working_directory(None)
+                    .map(|cwd| cwd.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.config.dir_rules.insert(
+                    dir_rule_id,
+                    config::DirRule {
+                        path,
+                        ..Default::default()
+                    },
+                );
+                self.dir_rule_expanded = Some(dir_rule_id);
+                self.dir_rule_cursor_text = String::new();
+                return self.save_dir_rules();
+            }
+            Message::DirRuleRemove(dir_rule_id) => {
+                self.config.dir_rules.remove(&dir_rule_id);
+                if self.dir_rule_expanded == Some(dir_rule_id) {
+                    self.dir_rule_expanded = None;
+                }
+                return self.save_dir_rules();
+            }
+            Message::DirRulePath(dir_rule_id, path) => {
+                if let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id) {
+                    rule.path = path;
+                }
+                return self.save_dir_rules();
+            }
+            Message::DirRuleUseCurrentDirectory(dir_rule_id) => {
+                if let Some(cwd) = self.terminal_working_directory(None)
+                    && let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id)
+                {
+                    rule.path = cwd.to_string_lossy().into_owned();
+                }
+                return self.save_dir_rules();
+            }
+            Message::DirRuleEnabled(dir_rule_id, enabled) => {
+                if let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id) {
+                    rule.enabled = enabled;
+                }
+                return self.save_dir_rules();
+            }
+            Message::DirRuleIncludeSubdirs(dir_rule_id, include_subdirs) => {
+                if let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id) {
+                    rule.include_subdirs = include_subdirs;
+                }
+                return self.save_dir_rules();
+            }
+            Message::DirRuleSyntaxTheme(dir_rule_id, color_scheme_kind, theme_i) => {
+                // Index 0 is the "inherit" entry, so the rest are offset by one.
+                let theme_name = theme_i.checked_sub(1).and_then(|i| {
+                    match color_scheme_kind {
+                        ColorSchemeKind::Dark => self.theme_names_dark.get(i),
+                        ColorSchemeKind::Light => self.theme_names_light.get(i),
+                    }
+                    .cloned()
+                });
+                if let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id) {
+                    match color_scheme_kind {
+                        ColorSchemeKind::Dark => rule.syntax_theme_dark = theme_name,
+                        ColorSchemeKind::Light => rule.syntax_theme_light = theme_name,
+                    }
+                }
+                return self.save_dir_rules();
+            }
+            Message::DirRuleOpacityPinned(dir_rule_id, pinned) => {
+                if let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id) {
+                    // Start from the global value, so pinning does not jump the
+                    // folder to some unrelated number before it is adjusted.
+                    rule.opacity = pinned.then_some(self.config.opacity);
+                }
+                return self.save_dir_rules();
+            }
+            Message::DirRuleOpacity(dir_rule_id, opacity) => {
+                if let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id) {
+                    rule.opacity = Some(cmp::min(100, opacity));
+                }
+                return self.save_dir_rules();
+            }
+            Message::DirRuleTabTitle(dir_rule_id, title) => {
+                if let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id) {
+                    // Empty means "inherit" rather than "an empty title".
+                    rule.tab_title = (!title.is_empty()).then_some(title);
+                }
+                return self.save_dir_rules();
+            }
+            Message::DirRuleCursor(dir_rule_id, text) => {
+                // The text box always accepts what is typed; the rule only takes
+                // it once it is a color. Otherwise `#f` on the way to `#ff0000`
+                // would be impossible to type.
+                self.dir_rule_cursor_text = text.clone();
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    if let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id) {
+                        rule.cursor = None;
+                    }
+                    return self.save_dir_rules();
+                }
+                if let Ok(cursor) = trimmed.parse::<HexColor>()
+                    && let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id)
+                {
+                    rule.cursor = Some(cursor);
+                    return self.save_dir_rules();
+                }
+            }
+            Message::DirRuleSaveHere(entity_opt) => {
+                let Some(cwd) = self.terminal_working_directory(entity_opt) else {
+                    log::warn!("cannot pin an appearance: no working directory for this terminal");
+                    return Task::none();
+                };
+                let profile_id_opt = self
+                    .pane_model
+                    .active()
+                    .and_then(|tab_model| {
+                        let entity = entity_opt.unwrap_or_else(|| tab_model.active());
+                        tab_model.data::<Mutex<Terminal>>(entity)
+                    })
+                    .and_then(|terminal| terminal.lock().unwrap().profile_id_opt);
+
+                let path = cwd.to_string_lossy().into_owned();
+                let rule = self.config.dir_rule_from_current(path, profile_id_opt);
+                // Edit the folder's existing rule rather than stacking a second
+                // one on the same directory, which would leave a dead entry the
+                // resolver ignores.
+                let dir_rule_id = self
+                    .config
+                    .dir_rule_for_exact_path(&cwd)
+                    .unwrap_or_else(|| self.config.next_dir_rule_id());
+                match self.config.dir_rules.get_mut(&dir_rule_id) {
+                    Some(existing) => {
+                        existing.syntax_theme_dark = rule.syntax_theme_dark;
+                        existing.syntax_theme_light = rule.syntax_theme_light;
+                        existing.opacity = rule.opacity;
+                        existing.enabled = true;
+                    }
+                    None => {
+                        self.config.dir_rules.insert(dir_rule_id, rule);
+                    }
+                }
+                return self.save_dir_rules();
+            }
+            Message::DirRuleRemoveHere(entity_opt) => {
+                let Some(cwd) = self.terminal_working_directory(entity_opt) else {
+                    return Task::none();
+                };
+                if let Some(dir_rule_id) = self.config.dir_rule_for_exact_path(&cwd) {
+                    self.config.dir_rules.remove(&dir_rule_id);
+                    if self.dir_rule_expanded == Some(dir_rule_id) {
+                        self.dir_rule_expanded = None;
+                    }
+                    return self.save_dir_rules();
+                }
+            }
             Message::ProfileNew => {
                 // Get next profile ID
                 let profile_id = self
@@ -3434,6 +3907,11 @@ impl Application for App {
                 Message::ToggleContextPage(ContextPage::ColorSchemes(color_scheme_kind)),
             )
             .title(fl!("color-schemes")),
+            ContextPage::DirectoryRules => context_drawer::context_drawer(
+                self.directory_rules(),
+                Message::ToggleContextPage(ContextPage::DirectoryRules),
+            )
+            .title(fl!("directory-rules")),
             ContextPage::KeyboardShortcuts => context_drawer::context_drawer(
                 self.keyboard_shortcuts(),
                 Message::ToggleContextPage(ContextPage::KeyboardShortcuts),
@@ -3515,7 +3993,13 @@ impl Application for App {
             && window_id == popup_id
         {
             return widget::autosize::autosize(
-                menu::context_menu(&self.config, &self.key_binds, entity, link.clone()),
+                menu::context_menu(
+                    &self.config,
+                    &self.key_binds,
+                    entity,
+                    link.clone(),
+                    self.terminal_has_dir_rule(Some(entity)),
+                ),
                 autosize_id.clone(),
             )
             .into();
@@ -3643,6 +4127,7 @@ impl Application for App {
                                     &self.key_binds,
                                     popup_entity,
                                     link.clone(),
+                                    self.terminal_has_dir_rule(Some(popup_entity)),
                                 ))
                                 .position(widget::popover::Position::Point(point));
                             popover.into()

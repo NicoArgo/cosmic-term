@@ -17,6 +17,24 @@ delete = Delete
 import = Import
 import-errors = Import errors
 
+## Directory rules
+directory-rules = Directory rules...
+directory-rules-description = Give a folder its own look. A rule covers that one folder — the folders inside it keep the global appearance until they get rules of their own.
+add-rule = Add rule
+rule-path = Folder
+rule-path-unset = (no folder set)
+rule-enabled = Enabled
+use-current-directory = Use current folder
+include-subdirectories = Include subfolders
+include-subdirectories-description = Cover everything below this folder as well
+inherit = Inherit
+pin-opacity = Pin transparency
+pin-opacity-description = Otherwise this folder follows the global setting
+rule-cursor-color = Cursor color
+rule-cursor-color-description = Leave empty to use the color scheme's cursor
+use-appearance-here = Use this appearance here
+remove-rule-here = Remove this folder's rule
+
 ## Profiles
 profiles = Profiles
 name = Name

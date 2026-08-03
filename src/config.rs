@@ -547,6 +547,57 @@ impl Config {
     /// Field by field is the point: a rule that only pins a color must not drag
     /// the other three along with it, otherwise every rule would silently
     /// freeze the whole appearance of its folder.
+    /// Rules listed by path, for the settings UI. Sorted by path rather than by
+    /// id so the list reads like a directory listing instead of like insertion
+    /// history.
+    pub fn dir_rule_paths(&self) -> Vec<(String, DirRuleId)> {
+        let mut paths: Vec<(String, DirRuleId)> = self
+            .dir_rules
+            .iter()
+            .map(|(id, rule)| (rule.path.clone(), *id))
+            .collect();
+        paths.sort_by(|a, b| LANGUAGE_SORTER.compare(&a.0, &b.0));
+        paths
+    }
+
+    /// The rule already covering `path` exactly, if there is one. Used by the
+    /// "use this appearance here" action so it edits the folder's rule instead
+    /// of stacking a second one on the same directory.
+    pub fn dir_rule_for_exact_path(&self, path: &Path) -> Option<DirRuleId> {
+        self.dir_rules
+            .iter()
+            .find(|(_, rule)| rule.absolute_path().as_deref() == Some(path))
+            .map(|(id, _)| *id)
+    }
+
+    /// A rule that pins how a terminal looks *right now*.
+    ///
+    /// Backs "use this appearance here": the point is to freeze the current
+    /// look for this folder, so later changes to the global settings stop
+    /// moving it. Only the colors and transparency are captured — a title and a
+    /// cursor are things you choose, not things the terminal currently "has".
+    pub fn dir_rule_from_current(
+        &self,
+        path: String,
+        profile_id_opt: Option<ProfileId>,
+    ) -> DirRule {
+        DirRule {
+            path,
+            syntax_theme_dark: Some(self.syntax_theme(ColorSchemeKind::Dark, profile_id_opt).0),
+            syntax_theme_light: Some(self.syntax_theme(ColorSchemeKind::Light, profile_id_opt).0),
+            opacity: Some(self.opacity),
+            ..Default::default()
+        }
+    }
+
+    /// The next free rule id.
+    pub fn next_dir_rule_id(&self) -> DirRuleId {
+        self.dir_rules
+            .last_key_value()
+            .map(|(id, _)| DirRuleId(id.0 + 1))
+            .unwrap_or_default()
+    }
+
     /// The opacity a directory rule pins for this folder, if it pins one.
     ///
     /// Kept separate from [`Self::effective_appearance`] because the view needs
@@ -890,6 +941,94 @@ mod tests {
             Some(DirRuleId(3)),
             "the subtree rule must reach down"
         );
+    }
+
+    #[test]
+    fn saving_an_appearance_twice_edits_one_rule_instead_of_stacking() {
+        // "Use this appearance here" has to find the folder's existing rule.
+        // Adding a second rule on the same path would leave a dead entry that
+        // the resolver ignores, and the user would see their edit do nothing.
+        let mut config = Config::default();
+        config
+            .dir_rules
+            .insert(DirRuleId(1), rule("/home/nico/projects"));
+        config.dir_rules.insert(DirRuleId(2), rule("/srv"));
+
+        assert_eq!(
+            config.dir_rule_for_exact_path(Path::new("/home/nico/projects")),
+            Some(DirRuleId(1))
+        );
+        assert_eq!(config.dir_rule_for_exact_path(Path::new("/srv")), Some(DirRuleId(2)));
+        // A folder merely *covered* by a rule is not the same as one the rule
+        // names: saving there must make a new rule, not edit the parent's.
+        assert_eq!(
+            config.dir_rule_for_exact_path(Path::new("/home/nico/projects/foo")),
+            None
+        );
+    }
+
+    #[test]
+    fn pinning_the_current_appearance_captures_colors_and_opacity_only() {
+        // The point is to freeze how the terminal looks now, so later changes to
+        // the global settings stop moving this folder. A title and a cursor are
+        // things you choose, not things it currently "has".
+        let mut config = Config::default();
+        config.opacity = 72;
+        config.syntax_theme_dark = "Global Dark".to_string();
+        config.syntax_theme_light = "Global Light".to_string();
+
+        let pinned = config.dir_rule_from_current("/srv".to_string(), None);
+        assert_eq!(pinned.syntax_theme_dark.as_deref(), Some("Global Dark"));
+        assert_eq!(pinned.syntax_theme_light.as_deref(), Some("Global Light"));
+        assert_eq!(pinned.opacity, Some(72));
+        assert_eq!(pinned.tab_title, None);
+        assert_eq!(pinned.cursor, None);
+        assert!(!pinned.include_subdirs, "pinning must not paint the subtree");
+
+        // And it really is frozen: moving the global no longer moves it.
+        config.opacity = 30;
+        config.dir_rules.insert(DirRuleId(1), pinned);
+        assert_eq!(config.effective_opacity(Some(DirRuleId(1))), 72);
+    }
+
+    #[test]
+    fn pinning_captures_the_profiles_colors_when_there_is_one() {
+        let mut config = Config::default();
+        config.syntax_theme_dark = "Global Dark".to_string();
+        config.profiles.insert(
+            ProfileId(1),
+            Profile {
+                syntax_theme_dark: "Profile Dark".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let pinned = config.dir_rule_from_current("/srv".to_string(), Some(ProfileId(1)));
+        assert_eq!(pinned.syntax_theme_dark.as_deref(), Some("Profile Dark"));
+    }
+
+    #[test]
+    fn new_rule_ids_do_not_collide_with_existing_ones() {
+        let mut config = Config::default();
+        assert_eq!(config.next_dir_rule_id(), DirRuleId(0));
+        config.dir_rules.insert(DirRuleId(0), rule("/a"));
+        config.dir_rules.insert(DirRuleId(4), rule("/b"));
+        assert_eq!(config.next_dir_rule_id(), DirRuleId(5));
+    }
+
+    #[test]
+    fn rules_are_listed_by_path_not_by_insertion_order() {
+        let mut config = Config::default();
+        config.dir_rules.insert(DirRuleId(1), rule("/srv"));
+        config.dir_rules.insert(DirRuleId(2), rule("/etc"));
+        config.dir_rules.insert(DirRuleId(3), rule("/home"));
+
+        let listed: Vec<String> = config
+            .dir_rule_paths()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(listed, ["/etc", "/home", "/srv"]);
     }
 
     #[test]
