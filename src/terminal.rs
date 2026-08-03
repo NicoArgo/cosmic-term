@@ -28,12 +28,12 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     fs, io, mem,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicU32, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 
@@ -261,6 +261,11 @@ pub struct Terminal {
     notifier: Notifier,
     search_regex_opt: Option<RegexSearch>,
     search_value: String,
+    /// Working directory as of the last poll, so a `cd` can be spotted by
+    /// comparison. Starts empty: the first poll then establishes it, which also
+    /// covers terminals whose starting directory was not known at creation.
+    cwd: Option<PathBuf>,
+    cwd_polled_at: Instant,
     shell_pid: Option<u32>,
     size: Size,
     use_bright_bold: bool,
@@ -364,6 +369,8 @@ impl Terminal {
             dir_rule_id_opt,
             search_regex_opt: None,
             search_value: String::new(),
+            cwd: None,
+            cwd_polled_at: Instant::now(),
             shell_pid,
             size,
             tab_title_override,
@@ -447,6 +454,34 @@ impl Terminal {
 
     pub fn input_no_scroll<I: Into<Cow<'static, [u8]>>>(&self, input: I) {
         self.notifier.notify(input);
+    }
+
+    /// Re-read the shell's working directory and report whether it moved.
+    ///
+    /// Rate limited because the caller is terminal output: a command printing
+    /// thousands of lines would otherwise turn into thousands of `readlink`s.
+    /// Nothing runs at all while the terminal is idle, which is why this is
+    /// driven by output instead of a timer.
+    pub fn poll_working_directory(&mut self) -> bool {
+        const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+        let now = Instant::now();
+        if now.duration_since(self.cwd_polled_at) < POLL_INTERVAL {
+            return false;
+        }
+        self.cwd_polled_at = now;
+
+        let cwd = self.working_directory();
+        if cwd == self.cwd {
+            return false;
+        }
+        self.cwd = cwd;
+        true
+    }
+
+    /// The shell's working directory as of the last [`Self::poll_working_directory`].
+    pub fn polled_working_directory(&self) -> Option<&Path> {
+        self.cwd.as_deref()
     }
 
     pub fn working_directory(&self) -> Option<PathBuf> {

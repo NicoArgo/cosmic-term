@@ -825,6 +825,51 @@ mod tests {
     }
 
     #[test]
+    fn a_hand_written_rule_file_loads_with_sane_defaults() {
+        // Rules are meant to be editable by hand in the config store, so the
+        // minimal thing someone would actually type has to work: naming a path
+        // and one field, and getting the documented defaults for the rest.
+        let written: BTreeMap<DirRuleId, DirRule> = ron::from_str(
+            r#"{
+                1: (path: "~/projects", opacity: Some(85)),
+            }"#,
+        )
+        .expect("a minimal hand-written rule must parse");
+
+        let rule = &written[&DirRuleId(1)];
+        assert_eq!(rule.path, "~/projects");
+        assert_eq!(rule.opacity, Some(85));
+        assert!(rule.enabled, "a rule must be live unless it says otherwise");
+        assert!(
+            rule.include_subdirs,
+            "subdirectories must be covered by default"
+        );
+        assert_eq!(rule.syntax_theme_dark, None);
+        assert_eq!(rule.cursor, None);
+    }
+
+    #[test]
+    fn rules_survive_a_round_trip_through_the_config_store() {
+        let mut rules = BTreeMap::new();
+        rules.insert(
+            DirRuleId(1),
+            DirRule {
+                include_subdirs: false,
+                opacity: Some(70),
+                cursor: Some(HexColor::rgb(0x00, 0xff, 0x00)),
+                tab_title: Some("prod".to_string()),
+                syntax_theme_dark: Some("Red Alert".to_string()),
+                ..rule("/srv/prod")
+            },
+        );
+
+        let encoded = ron::to_string(&rules).expect("rules must serialize");
+        let decoded: BTreeMap<DirRuleId, DirRule> =
+            ron::from_str(&encoded).expect("rules must round-trip");
+        assert_eq!(decoded, rules);
+    }
+
+    #[test]
     fn a_pinned_opacity_is_distinguishable_from_an_inherited_one() {
         // The view needs to tell "this folder asked for 90%" apart from
         // "nobody asked, the global happens to be 90%", because blur treats

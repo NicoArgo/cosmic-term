@@ -694,6 +694,13 @@ impl App {
             for entity in tab_model.iter() {
                 if let Some(terminal) = tab_model.data::<Mutex<Terminal>>(entity) {
                     let mut terminal = terminal.lock().unwrap();
+                    // Re-resolve first: editing a rule can change *which* rule
+                    // owns a directory, not just how it looks, and set_config
+                    // alone would keep styling from the old one. Uses the cached
+                    // directory, so this stays free of I/O.
+                    terminal.dir_rule_id_opt = terminal
+                        .polled_working_directory()
+                        .and_then(|cwd| resolve_dir_rule(&self.config.dir_rules, cwd));
                     terminal.set_config(&self.config, color_scheme_kind, &self.themes);
                 }
             }
@@ -1548,6 +1555,60 @@ impl App {
         let terminal = tab_model.data::<Mutex<Terminal>>(entity)?;
         let terminal = terminal.lock().unwrap();
         terminal.working_directory()
+    }
+
+    /// Re-resolve which directory rule applies to a terminal, and restyle it if
+    /// the answer changed.
+    ///
+    /// Driven by terminal output rather than a timer, so it costs nothing while
+    /// the terminal sits idle and still lands right when it matters — the shell
+    /// prints a prompt immediately after a `cd`.
+    fn update_dir_rule(
+        &mut self,
+        pane: pane_grid::Pane,
+        entity: segmented_button::Entity,
+    ) -> Task<Message> {
+        // With no rules there is nothing to resolve against, so nobody who has
+        // not used the feature pays even the cost of reading /proc.
+        if self.config.dir_rules.is_empty() {
+            return Task::none();
+        }
+
+        let color_scheme_kind = self.config.color_scheme_kind(self.core.system_theme());
+        let Some(tab_model) = self.pane_model.panes.get_mut(pane) else {
+            return Task::none();
+        };
+        let Some(terminal_mutex) = tab_model.data::<Mutex<Terminal>>(entity) else {
+            return Task::none();
+        };
+
+        let new_title = {
+            let mut terminal = terminal_mutex.lock().unwrap();
+            if !terminal.poll_working_directory() {
+                return Task::none();
+            }
+
+            let dir_rule_id_opt = terminal
+                .polled_working_directory()
+                .and_then(|cwd| resolve_dir_rule(&self.config.dir_rules, cwd));
+
+            // Moving within the same rule's territory must not restyle: it
+            // would be pure churn, and any flicker would be on every prompt.
+            if dir_rule_id_opt == terminal.dir_rule_id_opt {
+                return Task::none();
+            }
+
+            terminal.dir_rule_id_opt = dir_rule_id_opt;
+            terminal.set_config(&self.config, color_scheme_kind, &self.themes);
+            terminal.tab_title_override.clone()
+        };
+
+        // Leaving a folder whose rule set a title has to drop that title, or it
+        // would linger over the next directory. Same fallback upstream uses
+        // when an override goes away; the shell re-titles on its next prompt.
+        tab_model.text_set(entity, new_title.unwrap_or_else(|| fl!("new-terminal")));
+
+        self.update_title(Some(pane))
     }
 
     fn create_and_focus_new_terminal(
@@ -3171,6 +3232,9 @@ impl Application for App {
                             let mut terminal = terminal.lock().unwrap();
                             terminal.needs_update = true;
                         }
+                        // Output is also how a `cd` announces itself: the shell
+                        // prints its prompt right after moving.
+                        return self.update_dir_rule(pane, entity);
                     }
                     TermEvent::ChildExit(_error_code) => {
                         //Ignore this for now
