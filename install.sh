@@ -20,13 +20,22 @@ if [ ! -f cosmic-term.orig ] && [ -f /usr/bin/cosmic-term ]; then
         echo
         echo "!! The installed cosmic-term is $SYSTEM_VER, but this fork is based"
         echo "   on upstream $OURS_VER."
-        echo "   The backup about to be taken is what ./uninstall.sh restores, so"
-        echo "   uninstalling later would put $SYSTEM_VER back, not the current release."
-        echo "   To avoid that, cancel now (Ctrl+C) and run first:"
-        echo "       sudo apt upgrade cosmic-term"
-        echo "   Continuing is safe either way — recover with:"
-        echo "       sudo apt install --reinstall cosmic-term"
         echo
+        echo "   The backup about to be taken is what ./uninstall.sh restores, so"
+        echo "   taking it now would freeze $SYSTEM_VER as 'the original' and"
+        echo "   uninstalling later would quietly downgrade you to it."
+        echo
+        echo "   Bring the package up to date first, then run this again:"
+        echo "       sudo apt install --only-upgrade cosmic-term"
+        echo
+        echo "   (--reinstall would put $SYSTEM_VER back, not the current release.)"
+        echo
+        echo "   To take the backup anyway, knowing the above:"
+        echo "       POP_FLOW_ALLOW_STALE_BACKUP=1 ./install.sh"
+        # Refuses rather than warns. This used to print a warning and carry on,
+        # and a warning in the middle of a long build scrolls past — the backup
+        # was already wrong by the time anyone read it.
+        [ "${POP_FLOW_ALLOW_STALE_BACKUP:-0}" = "1" ] || exit 1
     fi
 fi
 
