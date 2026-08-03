@@ -20,7 +20,17 @@ and transparency, title and cursor keep inheriting — including from the global
 settings, so moving the global opacity still moves every folder that did not pin
 its own.
 
-### There is no settings UI yet
+### Setting it up
+
+Right-click in a terminal → **Use this appearance here** pins how it looks right
+now onto the folder you are in. From there, **File → Directory rules...** opens
+the page to adjust it: color scheme, transparency, tab title, cursor, and
+whether the rule covers the folder's subtree.
+
+Each field can be left inheriting, which is what keeps folders independent —
+pin a color and transparency still follows the global setting.
+
+### Editing the rules file directly
 
 Rules live in the COSMIC config store, one file per key:
 
@@ -28,8 +38,8 @@ Rules live in the COSMIC config store, one file per key:
 ~/.config/cosmic/com.system76.CosmicTerm/v1/dir_rules
 ```
 
-Write it by hand for now (the file is watched, so open terminals react
-immediately):
+Editing it by hand still works, and the file is watched, so open terminals react
+immediately:
 
 ```ron
 {

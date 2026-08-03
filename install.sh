@@ -56,6 +56,5 @@ echo "    Note: terminals already open keep the OLD binary — including this on
 echo "    Open a NEW terminal window to get per-directory appearance."
 echo "    (No process is killed here: doing so would close your open shells.)"
 echo
-echo "    There is no settings UI yet. To try it, put rules in:"
-echo "      ~/.config/cosmic/com.system76.CosmicTerm/v1/dir_rules"
-echo "    See README.md for the format."
+echo "    To use it: right-click in a terminal -> 'Use this appearance here',"
+echo "    then File -> 'Directory rules...' to adjust. See README.md."
