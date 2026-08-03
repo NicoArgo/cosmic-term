@@ -9,6 +9,7 @@ use hex_color::HexColor;
 use serde::{Deserialize, Serialize};
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::{fl, localize::LANGUAGE_SORTER, shortcuts::Shortcuts};
@@ -216,6 +217,149 @@ impl Default for Profile {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct DirRuleId(pub u64);
+
+/// An appearance bound to a directory, so a folder can look different from the
+/// rest without touching the global settings.
+///
+/// Every appearance field is an `Option` where `None` means "no opinion,
+/// inherit". That is what keeps folders independent from each other and from
+/// the global settings: a rule that only sets a color leaves opacity, title and
+/// cursor alone, and changing the global opacity still moves every folder that
+/// did not pin its own.
+///
+/// Kept separate from [`Profile`] on purpose: a profile says *what to run*, a
+/// rule says *how it looks*. Folding the two together would mean inventing a
+/// profile every time you just wanted to paint a directory.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct DirRule {
+    /// Directory this rule applies to. Absolute, except for a leading `~`,
+    /// which is expanded when the rule is matched (so the config stays portable
+    /// between machines with different user names).
+    pub path: String,
+    /// Whether the rule also covers directories below `path`. With this off the
+    /// rule only fires on the exact directory.
+    pub include_subdirs: bool,
+    /// Lets a rule be kept but parked, instead of having to delete it.
+    pub enabled: bool,
+    pub syntax_theme_dark: Option<String>,
+    pub syntax_theme_light: Option<String>,
+    pub opacity: Option<u8>,
+    pub tab_title: Option<String>,
+    pub cursor: Option<HexColor>,
+}
+
+impl Default for DirRule {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            // A rule on `~/projects` covering only `~/projects` itself and none
+            // of the projects inside it would surprise most people.
+            include_subdirs: true,
+            enabled: true,
+            syntax_theme_dark: None,
+            syntax_theme_light: None,
+            opacity: None,
+            tab_title: None,
+            cursor: None,
+        }
+    }
+}
+
+impl DirRule {
+    /// The rule's path with a leading `~` expanded, or `None` when it cannot be
+    /// resolved to an absolute path. A relative path has no stable meaning here
+    /// — it would follow whatever directory the terminal happens to be in — so
+    /// it is treated as "matches nothing" rather than guessed at.
+    pub fn absolute_path(&self) -> Option<PathBuf> {
+        let trimmed = self.path.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix('~') {
+            // Only `~` and `~/...` are ours to expand; `~other-user` is a shell
+            // construct we do not implement, and silently reading it as this
+            // user's home would point the rule at the wrong directory.
+            if rest.is_empty() || rest.starts_with('/') {
+                let home = std::env::home_dir()?;
+                return Some(home.join(rest.trim_start_matches('/')));
+            }
+            return None;
+        }
+
+        let path = PathBuf::from(trimmed);
+        path.is_absolute().then_some(path)
+    }
+}
+
+/// How well a rule path covers `cwd`, as the number of path components matched,
+/// or `None` when the rule does not apply at all.
+///
+/// Comparison is component by component rather than by string prefix, so a rule
+/// on `/home/a` does not capture `/home/ab`.
+fn match_depth(rule_path: &Path, cwd: &Path, include_subdirs: bool) -> Option<usize> {
+    let mut depth = 0;
+    let mut cwd_components = cwd.components();
+
+    for rule_component in rule_path.components() {
+        if cwd_components.next()? != rule_component {
+            return None;
+        }
+        depth += 1;
+    }
+
+    // The rule path ran out first: cwd sits below it.
+    if cwd_components.next().is_some() && !include_subdirs {
+        return None;
+    }
+
+    Some(depth)
+}
+
+/// The rule that applies to `cwd`, if any.
+///
+/// The most specific rule wins, measured in path components matched — so a rule
+/// on `~/projects/prod` beats one on `~/projects`, and "exact match beats
+/// inherited-from-parent" falls out of that for free. Ties (only possible
+/// between rules with the same path) go to the lowest id, so the result never
+/// depends on iteration luck.
+pub fn resolve_dir_rule(rules: &BTreeMap<DirRuleId, DirRule>, cwd: &Path) -> Option<DirRuleId> {
+    let mut best: Option<(usize, DirRuleId)> = None;
+
+    // BTreeMap iterates in ascending id order and we only replace on a strictly
+    // deeper match, so the lowest id naturally survives a tie.
+    for (id, rule) in rules {
+        if !rule.enabled {
+            continue;
+        }
+        let Some(rule_path) = rule.absolute_path() else {
+            continue;
+        };
+        let Some(depth) = match_depth(&rule_path, cwd, rule.include_subdirs) else {
+            continue;
+        };
+        if best.is_none_or(|(best_depth, _)| depth > best_depth) {
+            best = Some((depth, *id));
+        }
+    }
+
+    best.map(|(_, id)| id)
+}
+
+/// The appearance a terminal actually renders with, after the directory rule,
+/// the profile and the global settings have been layered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Appearance {
+    pub syntax_theme: String,
+    pub opacity: u8,
+    pub tab_title: Option<String>,
+    pub cursor: Option<HexColor>,
+}
+
 #[derive(Clone, CosmicConfigEntry, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Config {
     pub app_theme: AppTheme,
@@ -229,6 +373,9 @@ pub struct Config {
     pub font_stretch: u16,
     pub font_size_zoom_step_mul_100: u16,
     pub opacity: u8,
+    /// Per-directory appearance overrides. See [`DirRule`].
+    #[serde(default)]
+    pub dir_rules: BTreeMap<DirRuleId, DirRule>,
     pub profiles: BTreeMap<ProfileId, Profile>,
     pub show_headerbar: bool,
     pub show_pane_borders: bool,
@@ -259,6 +406,7 @@ impl Default for Config {
             font_stretch: Stretch::Normal.to_number(),
             font_weight: Weight::NORMAL.0,
             opacity: 100,
+            dir_rules: BTreeMap::new(),
             profiles: BTreeMap::new(),
             show_headerbar: true,
             show_pane_borders: false,
@@ -385,6 +533,45 @@ impl Config {
         (theme_name, color_scheme_kind)
     }
 
+    /// Layer directory rule over profile over global, field by field.
+    ///
+    /// Field by field is the point: a rule that only pins a color must not drag
+    /// the other three along with it, otherwise every rule would silently
+    /// freeze the whole appearance of its folder.
+    pub fn effective_appearance(
+        &self,
+        color_scheme_kind: ColorSchemeKind,
+        profile_id_opt: Option<ProfileId>,
+        dir_rule_id_opt: Option<DirRuleId>,
+    ) -> Appearance {
+        let rule_opt = dir_rule_id_opt.and_then(|id| self.dir_rules.get(&id));
+        let profile_opt = profile_id_opt.and_then(|id| self.profiles.get(&id));
+
+        let rule_theme = rule_opt.and_then(|rule| match color_scheme_kind {
+            ColorSchemeKind::Dark => rule.syntax_theme_dark.clone(),
+            ColorSchemeKind::Light => rule.syntax_theme_light.clone(),
+        });
+
+        Appearance {
+            // `syntax_theme` already resolves profile over global, so the rule
+            // is the only layer left to add on top.
+            syntax_theme: rule_theme
+                .unwrap_or_else(|| self.syntax_theme(color_scheme_kind, profile_id_opt).0),
+            // Profiles carry no opacity of their own, so this falls straight
+            // through to the global value.
+            opacity: rule_opt.and_then(|rule| rule.opacity).unwrap_or(self.opacity),
+            tab_title: rule_opt
+                .and_then(|rule| rule.tab_title.clone())
+                .or_else(|| {
+                    profile_opt
+                        .map(|profile| profile.tab_title.clone())
+                        .filter(|title| !title.is_empty())
+                })
+                .filter(|title| !title.is_empty()),
+            cursor: rule_opt.and_then(|rule| rule.cursor),
+        }
+    }
+
     pub fn typed_font_stretch(&self) -> Stretch {
         macro_rules! populate_num_typed_map {
             ($($stretch:ident,)+) => {
@@ -402,5 +589,235 @@ impl Config {
                 Normal, SemiExpanded, Expanded, ExtraExpanded, UltraExpanded,
             }
         })[&self.font_stretch]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(path: &str) -> DirRule {
+        DirRule {
+            path: path.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn rules(list: &[(u64, DirRule)]) -> BTreeMap<DirRuleId, DirRule> {
+        list.iter()
+            .map(|(id, rule)| (DirRuleId(*id), rule.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn a_rule_covers_its_subdirectories() {
+        let rules = rules(&[(1, rule("/home/nico/projects"))]);
+        assert_eq!(
+            resolve_dir_rule(&rules, Path::new("/home/nico/projects/foo/bar")),
+            Some(DirRuleId(1))
+        );
+    }
+
+    #[test]
+    fn the_most_specific_rule_wins() {
+        // The whole point of nesting: a rule deeper in the tree must override
+        // the one it sits inside, no matter what order they are stored in.
+        let rules = rules(&[
+            (1, rule("/home/nico/projects")),
+            (2, rule("/home/nico/projects/prod")),
+        ]);
+        assert_eq!(
+            resolve_dir_rule(&rules, Path::new("/home/nico/projects/prod/src")),
+            Some(DirRuleId(2))
+        );
+        assert_eq!(
+            resolve_dir_rule(&rules, Path::new("/home/nico/projects/dev")),
+            Some(DirRuleId(1))
+        );
+    }
+
+    #[test]
+    fn matching_is_by_path_component_not_string_prefix() {
+        // `/home/a` must not capture `/home/ab`. String-prefix matching would,
+        // and would paint an unrelated folder.
+        let rules = rules(&[(1, rule("/home/a"))]);
+        assert_eq!(resolve_dir_rule(&rules, Path::new("/home/ab")), None);
+        assert_eq!(
+            resolve_dir_rule(&rules, Path::new("/home/a")),
+            Some(DirRuleId(1))
+        );
+    }
+
+    #[test]
+    fn subdirectories_can_be_excluded() {
+        let rules = rules(&[(
+            1,
+            DirRule {
+                include_subdirs: false,
+                ..rule("/home/nico/projects")
+            },
+        )]);
+        assert_eq!(
+            resolve_dir_rule(&rules, Path::new("/home/nico/projects")),
+            Some(DirRuleId(1))
+        );
+        assert_eq!(
+            resolve_dir_rule(&rules, Path::new("/home/nico/projects/foo")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_disabled_rule_never_matches() {
+        let rules = rules(&[(
+            1,
+            DirRule {
+                enabled: false,
+                ..rule("/home/nico")
+            },
+        )]);
+        assert_eq!(resolve_dir_rule(&rules, Path::new("/home/nico")), None);
+    }
+
+    #[test]
+    fn a_parked_rule_does_not_shadow_a_live_one() {
+        // Disabling the deeper rule has to hand the directory back to the
+        // shallower one, not leave it unmatched.
+        let rules = rules(&[
+            (1, rule("/home/nico")),
+            (
+                2,
+                DirRule {
+                    enabled: false,
+                    ..rule("/home/nico/projects")
+                },
+            ),
+        ]);
+        assert_eq!(
+            resolve_dir_rule(&rules, Path::new("/home/nico/projects")),
+            Some(DirRuleId(1))
+        );
+    }
+
+    #[test]
+    fn overlapping_rules_resolve_deterministically() {
+        // Two rules on the same path: the answer must not depend on iteration
+        // order, or the terminal would flicker between them across restarts.
+        let rules = rules(&[(7, rule("/home/nico")), (3, rule("/home/nico"))]);
+        assert_eq!(
+            resolve_dir_rule(&rules, Path::new("/home/nico")),
+            Some(DirRuleId(3))
+        );
+    }
+
+    #[test]
+    fn an_unmatched_directory_has_no_rule() {
+        let rules = rules(&[(1, rule("/home/nico/projects"))]);
+        assert_eq!(resolve_dir_rule(&rules, Path::new("/etc")), None);
+        assert_eq!(resolve_dir_rule(&BTreeMap::new(), Path::new("/etc")), None);
+    }
+
+    #[test]
+    fn a_tilde_path_expands_to_the_home_directory() {
+        let Some(home) = std::env::home_dir() else {
+            return;
+        };
+        let rules = rules(&[(1, rule("~/projects"))]);
+        assert_eq!(
+            resolve_dir_rule(&rules, &home.join("projects/foo")),
+            Some(DirRuleId(1))
+        );
+    }
+
+    #[test]
+    fn unusable_rule_paths_match_nothing() {
+        // A relative path would follow whatever directory the terminal is in,
+        // and `~other` is a shell construct we do not implement — neither may
+        // be silently reinterpreted into a real directory.
+        assert_eq!(rule("projects").absolute_path(), None);
+        assert_eq!(rule("").absolute_path(), None);
+        assert_eq!(rule("   ").absolute_path(), None);
+        assert_eq!(rule("~otheruser/projects").absolute_path(), None);
+    }
+
+    #[test]
+    fn a_rule_only_overrides_the_fields_it_sets() {
+        // The independence guarantee: a rule that pins a color must leave
+        // opacity, title and cursor inheriting from the layers below it.
+        let mut config = Config::default();
+        config.opacity = 90;
+        config.syntax_theme_dark = "Global Dark".to_string();
+        config.dir_rules.insert(
+            DirRuleId(1),
+            DirRule {
+                syntax_theme_dark: Some("Rule Dark".to_string()),
+                ..rule("/home/nico")
+            },
+        );
+
+        let appearance =
+            config.effective_appearance(ColorSchemeKind::Dark, None, Some(DirRuleId(1)));
+        assert_eq!(appearance.syntax_theme, "Rule Dark");
+        assert_eq!(appearance.opacity, 90, "opacity must still come from global");
+        assert_eq!(appearance.tab_title, None);
+        assert_eq!(appearance.cursor, None);
+    }
+
+    #[test]
+    fn a_rule_outranks_its_profile_field_by_field() {
+        let mut config = Config::default();
+        config.syntax_theme_dark = "Global Dark".to_string();
+        config.profiles.insert(
+            ProfileId(1),
+            Profile {
+                syntax_theme_dark: "Profile Dark".to_string(),
+                tab_title: "Profile title".to_string(),
+                ..Default::default()
+            },
+        );
+        config.dir_rules.insert(
+            DirRuleId(1),
+            DirRule {
+                // Sets a title but no theme: the theme must fall through to the
+                // profile, not skip it and land on the global.
+                tab_title: Some("Rule title".to_string()),
+                ..rule("/home/nico")
+            },
+        );
+
+        let appearance = config.effective_appearance(
+            ColorSchemeKind::Dark,
+            Some(ProfileId(1)),
+            Some(DirRuleId(1)),
+        );
+        assert_eq!(appearance.syntax_theme, "Profile Dark");
+        assert_eq!(appearance.tab_title.as_deref(), Some("Rule title"));
+    }
+
+    #[test]
+    fn no_rule_leaves_the_existing_behaviour_untouched() {
+        // F1 must be inert until something starts resolving rules.
+        let mut config = Config::default();
+        config.opacity = 75;
+        config.syntax_theme_light = "Global Light".to_string();
+
+        let appearance = config.effective_appearance(ColorSchemeKind::Light, None, None);
+        assert_eq!(appearance.syntax_theme, "Global Light");
+        assert_eq!(appearance.opacity, 75);
+        assert_eq!(appearance.tab_title, None);
+        assert_eq!(appearance.cursor, None);
+    }
+
+    #[test]
+    fn an_empty_profile_title_is_not_a_title() {
+        // Profile.tab_title is a String, and upstream treats empty as unset.
+        let mut config = Config::default();
+        config
+            .profiles
+            .insert(ProfileId(1), Profile::default());
+
+        let appearance =
+            config.effective_appearance(ColorSchemeKind::Dark, Some(ProfileId(1)), None);
+        assert_eq!(appearance.tab_title, None);
     }
 }
