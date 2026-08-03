@@ -825,6 +825,25 @@ mod tests {
     }
 
     #[test]
+    fn the_documented_example_parses() {
+        // The snippet the ROADMAP tells people to type. If this drifts, the
+        // documented way to try the feature stops working.
+        let written: BTreeMap<DirRuleId, DirRule> = ron::from_str(
+            r##"{
+                1: (path: "~/projetos", opacity: Some(85), syntax_theme_dark: Some("Dracula")),
+                2: (path: "~/projetos/prod", tab_title: Some("PROD"), cursor: Some("#ff0000")),
+            }"##,
+        )
+        .expect("the example in the docs must parse");
+
+        assert_eq!(written[&DirRuleId(1)].opacity, Some(85));
+        assert_eq!(
+            written[&DirRuleId(2)].cursor,
+            Some(HexColor::rgb(0xff, 0x00, 0x00))
+        );
+    }
+
+    #[test]
     fn a_hand_written_rule_file_loads_with_sane_defaults() {
         // Rules are meant to be editable by hand in the config store, so the
         // minimal thing someone would actually type has to work: naming a path
