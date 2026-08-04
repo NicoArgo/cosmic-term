@@ -13,7 +13,8 @@ use cosmic::{
     Application, ApplicationExt, Element, action,
     app::{Core, Settings, Task, context_drawer},
     cosmic_config::{self, ConfigSet, CosmicConfigEntry},
-    cosmic_theme, executor,
+    cosmic_theme::{self, palette::Srgba},
+    executor,
     iced::{
         self, Alignment, Color, Event, Length, Limits, Padding, Subscription,
         advanced::graphics::text::font_system,
@@ -23,7 +24,7 @@ use cosmic::{
         mouse::{Button as MouseButton, Event as MouseEvent},
         stream, window,
     },
-    style,
+    style, theme,
     widget::{self, DndDestination, PaneGrid, about::About, button, pane_grid, segmented_button},
 };
 use cosmic::{Apply, surface};
@@ -38,10 +39,10 @@ use std::{
     env,
     error::Error,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process,
     rc::Rc,
-    sync::{LazyLock, Mutex, atomic::Ordering},
+    sync::{Arc, LazyLock, Mutex, atomic::Ordering},
 };
 use tokio::sync::mpsc;
 
@@ -86,6 +87,11 @@ use clap_lex::RawArgs;
 
 static ICON_CACHE: LazyLock<Mutex<IconCache>> = LazyLock::new(|| Mutex::new(IconCache::new()));
 
+/// Height of the folder identity stripe, in logical pixels. Thin enough to read
+/// as a marker rather than as chrome — it should register out of the corner of
+/// the eye without competing for the space the terminal needs.
+const IDENTITY_STRIPE_HEIGHT: f32 = 3.0;
+
 pub fn icon_cache_get(name: &'static str, size: u16) -> widget::icon::Icon {
     let mut icon_cache = ICON_CACHE.lock().unwrap();
     icon_cache.get(name, size)
@@ -125,6 +131,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             Some("--no-daemon") => {
                 daemonize = false;
+            }
+            Some(arg_str @ "--resolve-rule") => {
+                // Answered here, before the config handler and the GUI exist,
+                // because the callers are status bars that run this on every
+                // redraw. Starting a terminal to ask what color a folder is
+                // would cost more than the answer is worth.
+                if let Some(dir_arg) = raw_args.next_os(&mut cursor) {
+                    print!("{}", resolve_rule_for_shell(Path::new(&dir_arg)));
+                    return Ok(());
+                }
+                eprintln!("Missing argument for {arg_str}");
+                process::exit(1);
             }
             Some("-e") | Some("--command") | Some("--") => {
                 // Handle the '--command' or '-e' flag
@@ -228,8 +246,77 @@ Project home page: https://github.com/pop-os/cosmic-term
 Options:
   --help                          Show this message
   --version                       Show the version of cosmic-term
-  -w, --working-directory <dir>   Set the working directory for the terminal"#
+  -w, --working-directory <dir>   Set the working directory for the terminal
+  --resolve-rule <dir>            Print the directory rule's name and accent as
+                                  shell assignments, for prompts and status bars"#
     );
+}
+
+/// Quote a value so a shell `eval` reads it back as exactly one literal word.
+///
+/// Single quotes because they suspend every expansion the shell has; the dance
+/// around an embedded quote is the standard one, since single quotes cannot be
+/// escaped from within. Folder names are user input and end up in a `eval`, so
+/// this is a correctness requirement rather than tidiness.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// The assignments `--resolve-rule` prints.
+///
+/// A field with nothing to say prints **no assignment at all**, rather than an
+/// empty one: that is what lets a caller write `${RULE_NAME:-my default}` and
+/// keep its own fallback for folders that have no rule.
+///
+/// The accent goes out twice — as hex for callers that want a color, and as an
+/// ANSI `R;G;B` triplet so a prompt can drop it straight into an escape without
+/// teaching itself hex.
+fn shell_assignments(name: Option<&str>, accent: Option<HexColor>) -> String {
+    let mut out = String::new();
+
+    if let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) {
+        out.push_str(&format!("RULE_NAME={}\n", shell_quote(name)));
+    }
+
+    if let Some(accent) = accent {
+        out.push_str(&format!(
+            "RULE_ACCENT={}\n",
+            shell_quote(&accent.display_rgb().to_string())
+        ));
+        out.push_str(&format!(
+            "RULE_ACCENT_RGB={}\n",
+            shell_quote(&format!("{};{};{}", accent.r, accent.g, accent.b))
+        ));
+    }
+
+    out
+}
+
+/// Look up a directory's rule and render it as shell assignments.
+///
+/// Reads the config directly instead of asking a running terminal: there may be
+/// no terminal open on that folder, and a status bar asking about a directory is
+/// a question about configuration, not about any particular window.
+fn resolve_rule_for_shell(dir: &Path) -> String {
+    // A relative path has no stable meaning to a rule, so anchor it the way the
+    // caller would read it — against the process's own directory.
+    let dir = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        env::current_dir().unwrap_or_default().join(dir)
+    };
+
+    let config = match cosmic_config::Config::new(App::APP_ID, CONFIG_VERSION) {
+        // Partial config still answers this question: a broken unrelated key
+        // must not cost the caller its folder's identity.
+        Ok(handler) => Config::get_entry(&handler).unwrap_or_else(|(_errs, config)| config),
+        // No config store at all means no rules, which is a legitimate answer
+        // and not worth failing over.
+        Err(_) => return String::new(),
+    };
+
+    let (name, accent) = config.dir_identity(&dir);
+    shell_assignments(name.as_deref(), accent)
 }
 
 #[derive(Clone, Debug)]
@@ -423,6 +510,7 @@ pub enum Message {
     PasteValue(Option<segmented_button::Entity>, String),
     DirRuleCollapse(DirRuleId),
     DirRuleCursor(DirRuleId, String),
+    DirRuleAccent(DirRuleId, String),
     DirRuleEnabled(DirRuleId, bool),
     DirRuleExpand(DirRuleId),
     DirRuleIncludeSubdirs(DirRuleId, bool),
@@ -536,6 +624,12 @@ pub struct App {
     /// rule so a half-typed color (`#f`) can sit in the box without being
     /// rejected or committed.
     dir_rule_cursor_text: String,
+    /// In-progress text of the expanded rule's accent field, for the same reason
+    /// as the cursor one.
+    dir_rule_accent_text: String,
+    /// Accent the window chrome is currently wearing, so the theme is only
+    /// rebuilt when the answer actually changed. `None` means the system accent.
+    applied_accent: Option<HexColor>,
     themes: HashMap<(String, ColorSchemeKind), TermColors>,
     context_page: ContextPage,
     dialog_opt: Option<Dialog<Message>>,
@@ -755,8 +849,12 @@ impl App {
         // Set headerbar state
         self.core.window.show_headerbar = self.config.show_headerbar;
 
-        // Update application theme
-        cosmic::command::set_theme(theme)
+        // Update application theme, keeping the active folder's accent: this
+        // runs on every config write and on every system light/dark switch, and
+        // plain `theme` here would drop the accent on each one.
+        let accent = self.active_dir_accent();
+        self.applied_accent = accent;
+        cosmic::command::set_theme(self.themed_with_accent(accent))
     }
 
     fn update_render_active_pane_zoom(&mut self, zoom_message: Message) -> Task<Message> {
@@ -833,7 +931,9 @@ impl App {
         // Apply immediately: editing a rule with the folder open should show up
         // without waiting for the next prompt.
         self.reapply_dir_rules();
-        Task::none()
+        // The chrome too — typing a color and watching the window stay grey
+        // until the next tab switch would read as the setting not working.
+        self.update_accent()
     }
 
     /// Whether the folder a terminal is in already has a rule naming it. Drives
@@ -893,6 +993,67 @@ impl App {
     }
 
     // Call this any time the tab changes
+    /// The identity color of the terminal currently in front, if it has one.
+    ///
+    /// A window has many tabs and one set of chrome, so the accent follows the
+    /// focus — the same rule that already decides the title.
+    fn active_dir_accent(&self) -> Option<HexColor> {
+        // Costs nothing for someone who has never made a rule, which is the
+        // same bargain the rest of the feature strikes.
+        if self.config.dir_rules.is_empty() {
+            return None;
+        }
+
+        let tab_model = self.pane_model.panes.get(self.pane_model.focused())?;
+        let terminal = tab_model.data::<Mutex<Terminal>>(tab_model.active())?;
+        let dir_rule_id = terminal.lock().unwrap().dir_rule_id_opt?;
+        self.config.dir_rules.get(&dir_rule_id)?.accent
+    }
+
+    /// Repaint the window chrome in the active folder's accent, if that is not
+    /// already the color it is wearing.
+    ///
+    /// Guarded by the last applied value because this sits on the path that
+    /// every tab switch and every `cd` takes: rebuilding a theme that did not
+    /// change would be churn on a very hot path.
+    fn update_accent(&mut self) -> Task<Message> {
+        let accent = self.active_dir_accent();
+        if accent == self.applied_accent {
+            return Task::none();
+        }
+        self.applied_accent = accent;
+        cosmic::command::set_theme(self.themed_with_accent(accent))
+    }
+
+    /// The app theme with a folder's accent swapped in.
+    ///
+    /// Goes through libcosmic's own `with_accent`, which rebuilds from the
+    /// *user's* `ThemeBuilder` rather than the stock one — so nobody loses their
+    /// theme customizations by using a rule — and which normalizes the color's
+    /// lightness to the theme's. That normalization is the reason this is safe
+    /// to point at an arbitrary hex: contrast stays predictable even when the
+    /// chosen color is very light or very dark.
+    ///
+    /// Stays a `System` theme rather than becoming a custom one, so the window
+    /// keeps following the desktop between light and dark.
+    fn themed_with_accent(&self, accent: Option<HexColor>) -> theme::Theme {
+        let base = self.config.app_theme.theme();
+        let Some(accent) = accent else {
+            return base;
+        };
+
+        let srgba = Srgba::new(
+            f32::from(accent.r) / 255.0,
+            f32::from(accent.g) / 255.0,
+            f32::from(accent.b) / 255.0,
+            1.0,
+        );
+
+        let mut themed = theme::Theme::system(Arc::new(base.cosmic().with_accent(srgba)));
+        themed.transparent = base.transparent;
+        themed
+    }
+
     fn update_title(&mut self, pane: Option<pane_grid::Pane>) -> Task<Message> {
         let pane = pane.unwrap_or(self.pane_model.focused());
         if let Some(tab_model) = self.pane_model.panes.get(pane) {
@@ -911,6 +1072,11 @@ impl App {
                     Task::none()
                 },
                 self.update_focus(),
+                // Every path that changes which terminal is in front already
+                // comes through here, so this is the one place the accent has
+                // to be re-checked instead of a dozen call sites that would
+                // each be a chance to forget.
+                self.update_accent(),
             ])
         } else {
             log::error!("Failed to get the specific pane");
@@ -1402,6 +1568,12 @@ impl App {
                                 .on_paste(move |text| Message::DirRuleCursor(dir_rule_id, text))
                                 .into(),
                             widget::text::caption(fl!("rule-cursor-color-description")).into(),
+                            widget::text(fl!("rule-accent-color")).into(),
+                            widget::text_input("#rrggbb", &self.dir_rule_accent_text)
+                                .on_input(move |text| Message::DirRuleAccent(dir_rule_id, text))
+                                .on_paste(move |text| Message::DirRuleAccent(dir_rule_id, text))
+                                .into(),
+                            widget::text::caption(fl!("rule-accent-color-description")).into(),
                         ])
                         .spacing(space_xxxs)
                         .padding([0, space_s]),
@@ -1896,7 +2068,12 @@ impl App {
 
             terminal.dir_rule_id_opt = dir_rule_id_opt;
             terminal.set_config(&self.config, color_scheme_kind, &self.themes);
-            terminal.tab_title_override.clone()
+            // Rendered rather than raw: arriving in a folder whose name carries
+            // `{title}` must fill the placeholder from the title the program
+            // already set, not blank it until the next prompt redraws.
+            terminal
+                .rendered_tab_title()
+                .or_else(|| terminal.program_title.clone())
         };
 
         // Leaving a folder whose rule set a title has to drop that title, or it
@@ -2262,6 +2439,8 @@ impl Application for App {
             theme_names_light_or_inherit: Vec::new(),
             dir_rule_expanded: None,
             dir_rule_cursor_text: String::new(),
+            dir_rule_accent_text: String::new(),
+            applied_accent: None,
             themes: HashMap::new(),
             context_page: ContextPage::Settings,
             dialog_opt: None,
@@ -3098,6 +3277,13 @@ impl Application for App {
                     .and_then(|rule| rule.cursor)
                     .map(|cursor| cursor.display_rgb().to_string())
                     .unwrap_or_default();
+                self.dir_rule_accent_text = self
+                    .config
+                    .dir_rules
+                    .get(&dir_rule_id)
+                    .and_then(|rule| rule.accent)
+                    .map(|accent| accent.display_rgb().to_string())
+                    .unwrap_or_default();
             }
             Message::DirRuleNew => {
                 let dir_rule_id = self.config.next_dir_rule_id();
@@ -3117,6 +3303,7 @@ impl Application for App {
                 );
                 self.dir_rule_expanded = Some(dir_rule_id);
                 self.dir_rule_cursor_text = String::new();
+                self.dir_rule_accent_text = String::new();
                 return self.save_dir_rules();
             }
             Message::DirRuleRemove(dir_rule_id) => {
@@ -3206,6 +3393,23 @@ impl Application for App {
                     && let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id)
                 {
                     rule.cursor = Some(cursor);
+                    return self.save_dir_rules();
+                }
+            }
+            Message::DirRuleAccent(dir_rule_id, text) => {
+                // Same half-typed-color dance as the cursor field above.
+                self.dir_rule_accent_text = text.clone();
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    if let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id) {
+                        rule.accent = None;
+                    }
+                    return self.save_dir_rules();
+                }
+                if let Ok(accent) = trimmed.parse::<HexColor>()
+                    && let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id)
+                {
+                    rule.accent = Some(accent);
                     return self.save_dir_rules();
                 }
             }
@@ -3660,17 +3864,19 @@ impl Application for App {
                     }
                     TermEvent::ResetTitle => {
                         if let Some(tab_model) = self.pane_model.panes.get_mut(pane) {
-                            let tab_title_override =
+                            let rendered =
                                 if let Some(terminal) = tab_model.data::<Mutex<Terminal>>(entity) {
-                                    let terminal = terminal.lock().unwrap();
-                                    terminal.tab_title_override.clone()
+                                    let mut terminal = terminal.lock().unwrap();
+                                    // The program withdrew its title, so the
+                                    // live half of a `{title}` name has to go
+                                    // with it rather than linger.
+                                    terminal.program_title = None;
+                                    terminal.rendered_tab_title()
                                 } else {
                                     None
                                 };
-                            tab_model.text_set(
-                                entity,
-                                tab_title_override.unwrap_or_else(|| fl!("new-terminal")),
-                            );
+                            tab_model
+                                .text_set(entity, rendered.unwrap_or_else(|| fl!("new-terminal")));
                         }
                         return self.update_title(Some(pane));
                     }
@@ -3685,16 +3891,19 @@ impl Application for App {
                     }
                     TermEvent::Title(title) => {
                         if let Some(tab_model) = self.pane_model.panes.get_mut(pane) {
-                            let has_override =
+                            let rendered =
                                 if let Some(terminal) = tab_model.data::<Mutex<Terminal>>(entity) {
-                                    let terminal = terminal.lock().unwrap();
-                                    terminal.tab_title_override.is_some()
+                                    let mut terminal = terminal.lock().unwrap();
+                                    terminal.program_title = Some(title.clone());
+                                    terminal.rendered_tab_title()
                                 } else {
-                                    false
+                                    None
                                 };
-                            if !has_override {
-                                tab_model.text_set(entity, title);
-                            }
+                            // A folder name with no `{title}` still wins
+                            // outright — that is the fixed-label case, and it
+                            // must not flicker back to the program's title on
+                            // every prompt.
+                            tab_model.text_set(entity, rendered.unwrap_or(title));
                         }
                         return self.update_title(Some(pane));
                     }
@@ -4225,13 +4434,43 @@ impl Application for App {
         .on_drag(Message::PaneDragged);
 
         //TODO: apply window border radius xs at bottom of window
-        if show_pane_borders {
+        let content: Element<'_, Self::Message> = if show_pane_borders {
             // Each pane draws its own border stroke. Painting a filled
             // container behind the grid instead would stack its alpha with the
             // translucent panes and wash out the blurred backdrop.
             pane_grid.spacing(space_xxxs).into()
         } else {
             pane_grid.into()
+        };
+
+        // The folder's identity stripe. Drawn in the exact color the rule pins,
+        // unlike the chrome accent, which libcosmic normalizes for contrast:
+        // nothing is read against this, so it can afford to be the color that
+        // was actually chosen — and being the one literal swatch of it in the
+        // window is the whole point of a marker.
+        match self.active_dir_accent() {
+            Some(accent) => widget::column::with_capacity(2)
+                .push(
+                    widget::container(
+                        widget::Space::new()
+                            .width(Length::Fill)
+                            .height(Length::Fixed(IDENTITY_STRIPE_HEIGHT)),
+                    )
+                    .width(Length::Fill)
+                    .class(style::Container::Custom(Box::new(move |_theme| {
+                        cosmic::iced::widget::container::Style {
+                            background: Some(iced::Background::Color(Color::from_rgb8(
+                                accent.r, accent.g, accent.b,
+                            ))),
+                            ..Default::default()
+                        }
+                    }))),
+                )
+                .push(content)
+                .into(),
+            // No rule, no stripe: a terminal without an identity has to lay out
+            // exactly as it did before this existed, down to the pixel.
+            None => content,
         }
     }
 
@@ -4360,7 +4599,42 @@ fn pane_border(cosmic: &cosmic_theme::Theme, transparent: bool, show: bool) -> i
 
 #[cfg(test)]
 mod tests {
-    use super::{pane_border, pane_divider_color, terminal_opacity};
+    use super::{
+        HexColor, pane_border, pane_divider_color, shell_assignments, shell_quote, terminal_opacity,
+    };
+
+    #[test]
+    fn a_folder_without_a_rule_prints_nothing_to_assign() {
+        // The caller's `${RULE_NAME:-default}` only works if the variable stays
+        // unset. Printing empty assignments would silently blank its fallback.
+        assert_eq!(shell_assignments(None, None), "");
+    }
+
+    #[test]
+    fn the_accent_is_printed_both_as_hex_and_as_an_ansi_triplet() {
+        let out = shell_assignments(Some("POP FLOW"), Some(HexColor::rgb(0x48, 0xb9, 0xc7)));
+        assert!(out.contains("RULE_NAME='POP FLOW'\n"), "{out}");
+        assert!(out.contains("RULE_ACCENT='#48B9C7'\n"), "{out}");
+        // 0x48,0xb9,0xc7 = 72,185,199 — ready to drop into an escape sequence
+        // without the caller learning hex.
+        assert!(out.contains("RULE_ACCENT_RGB='72;185;199'\n"), "{out}");
+    }
+
+    #[test]
+    fn a_name_with_a_quote_cannot_break_out_of_the_eval() {
+        // Folder names are user input and the caller runs this through `eval`.
+        // The shell must see one word, whatever the name contains.
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote("; rm -rf /"), "'; rm -rf /'");
+        assert_eq!(shell_quote("$(whoami)"), "'$(whoami)'");
+    }
+
+    #[test]
+    fn a_blank_name_is_not_an_assignment() {
+        // A rule whose title is only whitespace has no name to report, and the
+        // caller should fall back rather than print a gap.
+        assert_eq!(shell_assignments(Some("   "), None), "");
+    }
 
     #[test]
     fn a_folders_pinned_opacity_survives_blur() {

@@ -254,8 +254,23 @@ pub struct DirRule {
     pub syntax_theme_dark: Option<String>,
     pub syntax_theme_light: Option<String>,
     pub opacity: Option<u8>,
+    /// The folder's name. Titles the tab, and — via `--resolve-rule` — labels
+    /// the folder anywhere outside the terminal that cares to ask.
+    ///
+    /// A `{title}` in here is replaced by whatever the running program set the
+    /// title to, so a folder can carry a fixed name *and* still show what is
+    /// happening in it. Without the placeholder the name replaces the program's
+    /// title outright, which is how this behaved before the placeholder existed.
     pub tab_title: Option<String>,
     pub cursor: Option<HexColor>,
+    /// The folder's identity color: the accent of the window chrome and the
+    /// stripe at the top, so a glance tells you which terminal you are in.
+    ///
+    /// Deliberately its own field rather than a color borrowed from the scheme
+    /// or the cursor. Those already have a job, and a field that means two
+    /// things is one that cannot change for one reason without breaking the
+    /// other.
+    pub accent: Option<HexColor>,
 }
 
 impl Default for DirRule {
@@ -271,7 +286,41 @@ impl Default for DirRule {
             opacity: None,
             tab_title: None,
             cursor: None,
+            accent: None,
         }
+    }
+}
+
+/// The title a tab shows, given the folder's name and the title the running
+/// program last set.
+///
+/// The placeholder is what lets a fixed folder name coexist with a live title
+/// instead of erasing it. When a name has no placeholder the program's title is
+/// dropped, which is the pre-placeholder behaviour and still the right answer
+/// for someone who wants the tab to say one thing and stay there.
+///
+/// An empty program title collapses the placeholder and tidies up the separator
+/// it leaves behind, so a fresh shell reads `POP FLOW` rather than `POP FLOW —`.
+pub fn render_tab_title(name: &str, program_title: Option<&str>) -> String {
+    const PLACEHOLDER: &str = "{title}";
+
+    if !name.contains(PLACEHOLDER) {
+        return name.to_string();
+    }
+
+    let program_title = program_title.map(str::trim).unwrap_or("");
+    let rendered = name.replace(PLACEHOLDER, program_title);
+
+    if program_title.is_empty() {
+        // Trim the separator the empty placeholder orphaned, from either side:
+        // the placeholder is as likely to lead (`{title} — POP FLOW`) as to
+        // trail. Only punctuation used as a separator goes; letters stay.
+        rendered
+            .trim()
+            .trim_matches(|c: char| c.is_whitespace() || matches!(c, '—' | '-' | '–' | ':' | '|' | '·'))
+            .to_string()
+    } else {
+        rendered.trim().to_string()
     }
 }
 
@@ -367,6 +416,10 @@ pub struct Appearance {
     pub opacity: u8,
     pub tab_title: Option<String>,
     pub cursor: Option<HexColor>,
+    /// `None` means "no folder identity here" — the window keeps the system
+    /// accent and grows no stripe, so a terminal without a rule looks exactly
+    /// like it did before rules existed.
+    pub accent: Option<HexColor>,
 }
 
 #[derive(Clone, CosmicConfigEntry, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -645,7 +698,33 @@ impl Config {
                 })
                 .filter(|title| !title.is_empty()),
             cursor: rule_opt.and_then(|rule| rule.cursor),
+            // Rule-only on purpose: a profile says *what to run*, and the same
+            // profile is meant to be reusable across folders. Letting it carry
+            // an identity color would make two folders running the same profile
+            // claim the same identity.
+            accent: rule_opt.and_then(|rule| rule.accent),
         }
+    }
+
+    /// The name and identity color a directory carries, for callers outside the
+    /// terminal — the statusline being the one that exists today.
+    ///
+    /// The name comes back with `{title}` already collapsed: a caller that is
+    /// not a terminal has no program title to substitute, and leaking the raw
+    /// placeholder into a status bar would be worse than dropping it.
+    pub fn dir_identity(&self, dir: &Path) -> (Option<String>, Option<HexColor>) {
+        let Some(rule) = resolve_dir_rule(&self.dir_rules, dir).and_then(|id| self.dir_rules.get(&id))
+        else {
+            return (None, None);
+        };
+
+        let name = rule
+            .tab_title
+            .as_deref()
+            .map(|name| render_tab_title(name, None))
+            .filter(|name| !name.is_empty());
+
+        (name, rule.accent)
     }
 
     pub fn typed_font_stretch(&self) -> Stretch {
@@ -1138,5 +1217,122 @@ mod tests {
         let appearance =
             config.effective_appearance(ColorSchemeKind::Dark, Some(ProfileId(1)), None);
         assert_eq!(appearance.tab_title, None);
+    }
+
+    #[test]
+    fn the_accent_comes_from_the_rule_and_nowhere_else() {
+        let mut config = Config::default();
+        config.profiles.insert(ProfileId(1), Profile::default());
+        config.dir_rules.insert(
+            DirRuleId(1),
+            DirRule {
+                accent: Some(HexColor::rgb(0x48, 0xb9, 0xc7)),
+                ..rule("/home/nico")
+            },
+        );
+
+        assert_eq!(
+            config
+                .effective_appearance(ColorSchemeKind::Dark, Some(ProfileId(1)), Some(DirRuleId(1)))
+                .accent,
+            Some(HexColor::rgb(0x48, 0xb9, 0xc7))
+        );
+        // No rule means no identity: the window must keep the system accent
+        // rather than invent one.
+        assert_eq!(
+            config
+                .effective_appearance(ColorSchemeKind::Dark, Some(ProfileId(1)), None)
+                .accent,
+            None
+        );
+    }
+
+    #[test]
+    fn a_name_without_the_placeholder_replaces_the_program_title() {
+        // The pre-placeholder behaviour, which someone who wants a tab to say
+        // one thing and stay there still depends on.
+        assert_eq!(render_tab_title("PROD", Some("vim src/main.rs")), "PROD");
+        assert_eq!(render_tab_title("PROD", None), "PROD");
+    }
+
+    #[test]
+    fn the_placeholder_lets_the_name_and_the_live_title_coexist() {
+        assert_eq!(
+            render_tab_title("POP FLOW — {title}", Some("vim src/main.rs")),
+            "POP FLOW — vim src/main.rs"
+        );
+        // Either side of the name, because a leading placeholder is as natural
+        // to write as a trailing one.
+        assert_eq!(
+            render_tab_title("{title} · POP FLOW", Some("claude")),
+            "claude · POP FLOW"
+        );
+    }
+
+    #[test]
+    fn an_empty_live_title_does_not_leave_a_dangling_separator() {
+        // A fresh shell sets no title. Without the tidy-up the tab would read
+        // "POP FLOW —", which looks like a bug every time it happens.
+        assert_eq!(render_tab_title("POP FLOW — {title}", None), "POP FLOW");
+        assert_eq!(render_tab_title("POP FLOW — {title}", Some("  ")), "POP FLOW");
+        assert_eq!(render_tab_title("{title} · POP FLOW", None), "POP FLOW");
+        // A name that is nothing but the placeholder collapses to nothing, and
+        // the caller falls back to its own default.
+        assert_eq!(render_tab_title("{title}", None), "");
+    }
+
+    #[test]
+    fn dir_identity_answers_what_the_statusline_asks() {
+        let mut config = Config::default();
+        config.dir_rules.insert(
+            DirRuleId(1),
+            DirRule {
+                tab_title: Some("POP FLOW — {title}".to_string()),
+                accent: Some(HexColor::rgb(0x48, 0xb9, 0xc7)),
+                ..rule("/home/nico/flow")
+            },
+        );
+
+        // The placeholder is collapsed: a status bar has no program title to
+        // put there, and printing "{title}" raw would be worse than dropping it.
+        let (name, accent) = config.dir_identity(Path::new("/home/nico/flow"));
+        assert_eq!(name.as_deref(), Some("POP FLOW"));
+        assert_eq!(accent, Some(HexColor::rgb(0x48, 0xb9, 0xc7)));
+
+        // A folder with no rule has no identity to report, and the caller keeps
+        // whatever default it had.
+        let (name, accent) = config.dir_identity(Path::new("/home/nico/outra"));
+        assert_eq!(name, None);
+        assert_eq!(accent, None);
+    }
+
+    #[test]
+    fn dir_identity_respects_the_one_folder_rule() {
+        // Same guarantee as the rest of T1: a rule covers its folder, not the
+        // tree below it, unless it opts in.
+        let mut config = Config::default();
+        config.dir_rules.insert(
+            DirRuleId(1),
+            DirRule {
+                tab_title: Some("POP FLOW".to_string()),
+                accent: Some(HexColor::rgb(0x48, 0xb9, 0xc7)),
+                ..rule("/home/nico/flow")
+            },
+        );
+
+        assert_eq!(
+            config.dir_identity(Path::new("/home/nico/flow/sub")).0,
+            None
+        );
+
+        config
+            .dir_rules
+            .get_mut(&DirRuleId(1))
+            .unwrap()
+            .include_subdirs = true;
+        assert_eq!(
+            config.dir_identity(Path::new("/home/nico/flow/sub")).0.as_deref(),
+            Some("POP FLOW")
+        );
     }
 }

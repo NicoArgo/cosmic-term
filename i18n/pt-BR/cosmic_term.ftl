@@ -36,6 +36,8 @@ pin-opacity = Fixar transparência
 pin-opacity-description = Sem isso, a pasta segue o ajuste global
 rule-cursor-color = Cor do cursor
 rule-cursor-color-description = Deixe vazio para usar o cursor do esquema de cores
+rule-accent-color = Cor da pasta
+rule-accent-color-description = Tinge o acento desta janela e põe uma faixa no topo. Deixe vazio para usar o acento do sistema
 use-appearance-here = Usar esta aparência aqui
 remove-rule-here = Remover a regra desta pasta
 

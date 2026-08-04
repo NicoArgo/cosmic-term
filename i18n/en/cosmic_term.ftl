@@ -32,6 +32,8 @@ pin-opacity = Pin transparency
 pin-opacity-description = Otherwise this folder follows the global setting
 rule-cursor-color = Cursor color
 rule-cursor-color-description = Leave empty to use the color scheme's cursor
+rule-accent-color = Folder color
+rule-accent-color-description = Tints this window's accent and adds a stripe at the top. Leave empty to use the system accent
 use-appearance-here = Use this appearance here
 remove-rule-here = Remove this folder's rule
 

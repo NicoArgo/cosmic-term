@@ -6,9 +6,9 @@ Fork of [pop-os/cosmic-term](https://github.com/pop-os/cosmic-term) for the
 ## POP Flow: appearance per directory
 
 Each folder can have its own terminal appearance — **color scheme,
-transparency, tab title and cursor color** — persisted independently of the
-global settings and of the other folders. It applies when a terminal opens in
-that folder, and live when you `cd` into it.
+transparency, tab title, cursor color and an identity color** — persisted
+independently of the global settings and of the other folders. It applies when a
+terminal opens in that folder, and live when you `cd` into it.
 
 **A rule covers one folder.** Each directory has its own identity and does not
 hand it down: a rule on `~/projects` says nothing about `~/projects/foo`, which
@@ -59,8 +59,9 @@ The key is any number, unique per rule. Fields:
 | `syntax_theme_dark` | inherit | Color scheme name, as shown in *View → Color schemes*. |
 | `syntax_theme_light` | inherit | Same, for light mode. |
 | `opacity` | inherit | `0`–`100`. |
-| `tab_title` | inherit | Fixed tab title for the folder. |
+| `tab_title` | inherit | The folder's name. `{title}` is replaced by the running program's title. |
 | `cursor` | scheme's | Cursor color, `"#rrggbb"`. |
+| `accent` | system's | The folder's identity color, `"#rrggbb"`. |
 
 With the rules above: `~/projects` is Dracula at 85%, `~/projects/prod` is titled
 `PROD` with a red cursor (and *not* Dracula, since rule 1 stops at its own
@@ -72,6 +73,60 @@ specific wins: a folder's own rule beats a tree reaching down into it.
 
 Matching is by path component, not string prefix — a rule on `/home/a` does not
 capture `/home/ab`.
+
+## POP Flow: the folder's identity
+
+`accent` and `tab_title` answer a different question from the rest: not *how does
+the text look* but *which terminal am I in*. A folder that sets them gets
+
+- the window's **accent** — active tab, focus, hover, action buttons — in its
+  color, while the header bar and menus keep the system's grey;
+- a thin **stripe** at the top of the window, in the exact color;
+- its **name** on the tab.
+
+The accent goes through COSMIC's own accent machinery, which rebuilds from *your*
+theme — so nothing else about your customization is lost — and normalizes the
+color's lightness for contrast. That is why the stripe, which has nothing read
+against it, is the one place the literal hex appears.
+
+### `{title}`
+
+A name replaces the running program's title outright, which is what you want for
+a tab that should say one thing and stay there. When you want both, put `{title}`
+in the name:
+
+```ron
+2: (path: "~/projects/prod", tab_title: Some("PROD — {title}"), accent: Some("#ff5252")),
+```
+
+The tab then reads `PROD — vim main.rs`, and collapses to just `PROD` when the
+program has set no title — no dangling separator.
+
+### Asking from outside the terminal
+
+Anything that wants to label a folder the same way can ask:
+
+```console
+$ cosmic-term --resolve-rule ~/projects/prod
+RULE_NAME='PROD'
+RULE_ACCENT='#FF5252'
+RULE_ACCENT_RGB='255;82;82'
+```
+
+Shell-quoted, so `eval` is safe, and it prints **nothing** for a folder with no
+rule — which is what lets a caller keep its own default:
+
+```bash
+eval "$(cosmic-term --resolve-rule "$PWD")"
+name=${RULE_NAME:-$(basename "$PWD")}
+```
+
+`RULE_ACCENT_RGB` is the same color as an ANSI triplet, ready to drop into an
+escape sequence. It reads the config directly and exits before starting a GUI, so
+it is cheap enough for a prompt or a status bar.
+
+The POP Flow suite uses this to drive the Claude Code statusline from the same
+rule that colors the window — see `.claude/statusline.sh` at the workspace root.
 
 ### Notes and limits
 

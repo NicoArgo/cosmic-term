@@ -40,7 +40,7 @@ use tokio::sync::mpsc;
 pub use alacritty_terminal::grid::Scroll as TerminalScroll;
 
 use crate::{
-    config::{ColorSchemeKind, Config as AppConfig, DirRuleId, ProfileId},
+    config::{ColorSchemeKind, Config as AppConfig, DirRuleId, ProfileId, render_tab_title},
     menu::MenuState,
     mouse_reporter::MouseReporter,
 };
@@ -246,6 +246,11 @@ pub struct Terminal {
     /// looks exactly as it did before this feature existed.
     pub dir_rule_id_opt: Option<DirRuleId>,
     pub tab_title_override: Option<String>,
+    /// Last title the running program set, kept so a `{title}` in the folder's
+    /// name can be re-rendered when the *rule* changes rather than only when the
+    /// program speaks. Without it, a `cd` into a named folder would blank the
+    /// live half of the title until the next prompt redrew it.
+    pub program_title: Option<String>,
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     pub url_regex_search: RegexSearch,
     pub regex_matches: Vec<alacritty_terminal::term::search::Match>,
@@ -374,11 +379,23 @@ impl Terminal {
             shell_pid,
             size,
             tab_title_override,
+            program_title: None,
             term,
             use_bright_bold,
             zoom_adj: Default::default(),
             is_focused: true,
         })
+    }
+
+    /// The title this tab should show, or `None` when the folder has nothing to
+    /// say and the caller should use the program's title (or its own default).
+    ///
+    /// `None` also covers a name that collapsed to nothing — a name of just
+    /// `{title}` with no program title — because an empty tab reads as broken.
+    pub fn rendered_tab_title(&self) -> Option<String> {
+        let name = self.tab_title_override.as_deref()?;
+        let rendered = render_tab_title(name, self.program_title.as_deref());
+        (!rendered.is_empty()).then_some(rendered)
     }
 
     pub fn buffer_weak(&self) -> Weak<Buffer> {
