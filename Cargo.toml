@@ -17,7 +17,8 @@ regex = "1"
 ron = "0.11"
 serde = { version = "1", features = ["serde_derive"] }
 shlex = "1"
-tokio = { version = "1", features = ["sync"] }
+# "time" for the debounced write of the directory rules (see edit_dir_rules).
+tokio = { version = "1", features = ["sync", "time"] }
 # CLI arguments
 clap_lex = "0.7"
 # Internationalization

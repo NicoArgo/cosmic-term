@@ -522,6 +522,10 @@ pub enum Message {
     PasteValue(Option<segmented_button::Entity>, String),
     DirRuleCollapse(DirRuleId),
     DirRuleAccent(DirRuleId, String),
+    /// A debounced write of the rules file has come due. Carries the edit it
+    /// was scheduled for, so a keystroke that lands in the meantime cancels it
+    /// simply by making this one stale.
+    DirRulesPersist(u64),
     /// Drives the color picker behind the folder-color swatch.
     ///
     /// Carries no rule id, unlike its neighbours: libcosmic wants a plain `fn`
@@ -585,6 +589,11 @@ pub enum Message {
     ZoomReset,
     ContextMenuPopupClosed(window::Id),
 }
+
+/// How long the rules file waits after the last keystroke before being written.
+/// Long enough that a burst of typing is one write, short enough that letting go
+/// of the keyboard and closing the window keeps what was typed.
+const DIR_RULES_PERSIST_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// Side of the square swatch that opens a color picker, in pixels. Matches the
 /// height of the hex box it sits beside.
@@ -669,6 +678,9 @@ pub struct App {
     theme_names_light_or_inherit: Vec<String>,
     /// Rule currently expanded in the directory-rules page.
     dir_rule_expanded: Option<DirRuleId>,
+    /// Counts edits to the rules, so a pending debounced write can tell whether
+    /// it is still the newest one. See [`App::edit_dir_rules`].
+    dir_rules_edit_seq: u64,
     /// In-progress text of the expanded rule's color field. Kept apart from the
     /// rule so a half-typed color (`#f`) can sit in the box without being
     /// rejected or committed.
@@ -974,18 +986,52 @@ impl App {
         }
     }
 
+    /// Apply the rules to this window, and write them to disk.
+    ///
+    /// For changes that arrive whole — a toggle, a new rule, a color settled by
+    /// the picker. Typing goes through [`Self::edit_dir_rules`] instead.
     fn save_dir_rules(&mut self) -> Task<Message> {
+        self.persist_dir_rules();
+        self.apply_dir_rules()
+    }
+
+    /// Apply an edit that is still being typed: live in this window now, on disk
+    /// once the typing stops.
+    ///
+    /// The file is watched, so every write also wakes every other cosmic-term to
+    /// re-read and re-resolve its rules. Writing per keystroke made a 40-character
+    /// path 40 writes and 40 wake-ups per open window — the same reason the color
+    /// picker only commits when a drag settles.
+    fn edit_dir_rules(&mut self) -> Task<Message> {
+        self.dir_rules_edit_seq = self.dir_rules_edit_seq.wrapping_add(1);
+        let seq = self.dir_rules_edit_seq;
+        Task::batch([
+            self.apply_dir_rules(),
+            Task::perform(
+                async move { tokio::time::sleep(DIR_RULES_PERSIST_DELAY).await },
+                move |()| cosmic::action::app(Message::DirRulesPersist(seq)),
+            ),
+        ])
+    }
+
+    /// The rules as this window shows them: the open terminals, then the chrome.
+    fn apply_dir_rules(&mut self) -> Task<Message> {
+        // Editing a rule with the folder open should show up without waiting for
+        // the next prompt.
+        self.reapply_dir_rules();
+        // The chrome too — typing a color and watching the window stay grey
+        // until the next tab switch would read as the setting not working.
+        self.update_accent()
+    }
+
+    /// Write the rules out, and cancel any write still waiting on a timer.
+    fn persist_dir_rules(&mut self) {
+        self.dir_rules_edit_seq = self.dir_rules_edit_seq.wrapping_add(1);
         if let Some(ref config_handler) = self.config_handler
             && let Err(err) = config_handler.set("dir_rules", &self.config.dir_rules)
         {
             log::error!("failed to save config: {}", err);
         }
-        // Apply immediately: editing a rule with the folder open should show up
-        // without waiting for the next prompt.
-        self.reapply_dir_rules();
-        // The chrome too — typing a color and watching the window stay grey
-        // until the next tab switch would read as the setting not working.
-        self.update_accent()
     }
 
     /// The rule's color, or `None` when the folder inherits.
@@ -2596,6 +2642,7 @@ impl Application for App {
             theme_names_dark_or_inherit: Vec::new(),
             theme_names_light_or_inherit: Vec::new(),
             dir_rule_expanded: None,
+            dir_rules_edit_seq: 0,
             dir_rule_accent_text: String::new(),
             dir_rule_accent_picker: dir_rule_color_picker(None),
             dir_rule_accent_before: None,
@@ -3425,6 +3472,9 @@ impl Application for App {
             Message::DirRuleCollapse(_dir_rule_id) => {
                 self.dir_rule_expanded = None;
                 self.reset_dir_rule_color_pickers(None);
+                // Folding the rule away ends the editing session, so whatever was
+                // typed goes to disk now instead of waiting on its timer.
+                self.persist_dir_rules();
             }
             Message::DirRuleExpand(dir_rule_id) => {
                 self.dir_rule_expanded = Some(dir_rule_id);
@@ -3469,7 +3519,7 @@ impl Application for App {
                 if let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id) {
                     rule.path = path;
                 }
-                return self.save_dir_rules();
+                return self.edit_dir_rules();
             }
             Message::DirRuleUseCurrentDirectory(dir_rule_id) => {
                 if let Some(cwd) = self.terminal_working_directory(None)
@@ -3496,7 +3546,7 @@ impl Application for App {
                     // Empty means "inherit" rather than "an empty title".
                     rule.tab_title = (!title.is_empty()).then_some(title);
                 }
-                return self.save_dir_rules();
+                return self.edit_dir_rules();
             }
             Message::DirRuleAccent(dir_rule_id, text) => {
                 // The text box always accepts what is typed; the rule only takes
@@ -3508,13 +3558,20 @@ impl Application for App {
                     if let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id) {
                         rule.accent = None;
                     }
-                    return self.save_dir_rules();
+                    return self.edit_dir_rules();
                 }
                 if let Ok(accent) = trimmed.parse::<HexColor>()
                     && let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id)
                 {
                     rule.accent = Some(accent);
-                    return self.save_dir_rules();
+                    return self.edit_dir_rules();
+                }
+            }
+            Message::DirRulesPersist(seq) => {
+                // Stale means another keystroke landed after this timer started;
+                // that edit has a timer of its own.
+                if seq == self.dir_rules_edit_seq {
+                    self.persist_dir_rules();
                 }
             }
             Message::DirRuleAccentPicker(update) => {
