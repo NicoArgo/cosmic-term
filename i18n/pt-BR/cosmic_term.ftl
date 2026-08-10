@@ -35,11 +35,22 @@ inherit = Herdar
 pin-opacity = Fixar transparência
 pin-opacity-description = Sem isso, a pasta segue o ajuste global
 rule-cursor-color = Cor do cursor
-rule-cursor-color-description = Deixe vazio para usar o cursor do esquema de cores
+rule-cursor-color-description = Digite um hexadecimal ou escolha no seletor de cor ao lado. Deixe vazio para usar o cursor do esquema de cores
 rule-accent-color = Cor da pasta
-rule-accent-color-description = Tinge o acento desta janela e põe uma faixa no topo. Deixe vazio para usar o acento do sistema
+rule-accent-color-description = Tinge o acento desta janela e põe uma faixa no topo. Digite um hexadecimal ou escolha no seletor de cor ao lado. Deixe vazio para usar o acento do sistema
 use-appearance-here = Usar esta aparência aqui
 remove-rule-here = Remover a regra desta pasta
+
+## Color picker
+
+color-picker-hex = Hex
+color-picker-rgb = RGB
+color-picker-recent = Cores recentes
+color-picker-copy = Copiar para a área de transferência
+color-picker-copied = Copiado para a área de transferência
+color-picker-clear = Limpar
+color-picker-done = Pronto
+color-picker-cancel = Cancelar
 
 ## Profiles
 
