@@ -1556,7 +1556,11 @@ impl App {
                         widget::column::with_children(vec![
                             widget::text(fl!("tab-title")).into(),
                             widget::text_input(
-                                fl!("inherit"),
+                                // The placeholder shows the name an empty field
+                                // actually produces, instead of "inherit" —
+                                // otherwise the folder gets titled and nothing
+                                // in this dialog says where the title came from.
+                                rule.derived_title().unwrap_or_else(|| fl!("inherit")),
                                 rule.tab_title.as_deref().unwrap_or(""),
                             )
                             .on_input(move |text| Message::DirRuleTabTitle(dir_rule_id, text))

@@ -349,6 +349,30 @@ impl DirRule {
         let path = PathBuf::from(trimmed);
         path.is_absolute().then_some(path)
     }
+
+    /// The name to fall back on when the rule pins everything about a folder
+    /// except what to call it.
+    ///
+    /// A rule that is switched on says the folder has an identity worth
+    /// showing. Left without a title, though, the window heading would say
+    /// "COSMIC Terminal" and anything asking from outside would reach for its
+    /// own hardcoded default — so the one folder ends up with two names, or
+    /// with none. Naming it after itself keeps every surface telling the same
+    /// story, and costs nothing to override: type a title and this stops
+    /// applying.
+    ///
+    /// Upper case because that is how these labels get written by hand
+    /// ("POP FLOW"), and because it reads as a name for the place rather than
+    /// as a path component echoed back.
+    ///
+    /// Derived from the *rule's* path, not from the terminal's directory: a
+    /// rule covering a subtree names the folder it covers, so everything under
+    /// it answers with one name instead of renaming itself on every `cd`.
+    pub fn derived_title(&self) -> Option<String> {
+        let path = self.absolute_path()?;
+        let name = path.file_name()?.to_str()?.trim();
+        (!name.is_empty()).then(|| name.to_uppercase())
+    }
 }
 
 /// How well a rule path covers `cwd`, as the number of path components matched,
@@ -696,7 +720,11 @@ impl Config {
                         .map(|profile| profile.tab_title.clone())
                         .filter(|title| !title.is_empty())
                 })
-                .filter(|title| !title.is_empty()),
+                .filter(|title| !title.is_empty())
+                // Last, so it only fills a gap: a title written on the rule or
+                // on the profile is a choice, and a choice outranks a name we
+                // inferred. See [`DirRule::derived_title`].
+                .or_else(|| rule_opt.and_then(DirRule::derived_title)),
             cursor: rule_opt.and_then(|rule| rule.cursor),
             // Rule-only on purpose: a profile says *what to run*, and the same
             // profile is meant to be reusable across folders. Letting it carry
@@ -722,7 +750,10 @@ impl Config {
             .tab_title
             .as_deref()
             .map(|name| render_tab_title(name, None))
-            .filter(|name| !name.is_empty());
+            .filter(|name| !name.is_empty())
+            // Same fallback, same order as the tab's, so the status bar and the
+            // window heading cannot end up calling one folder two things.
+            .or_else(|| rule.derived_title());
 
         (name, rule.accent)
     }
@@ -923,7 +954,12 @@ mod tests {
     #[test]
     fn a_rule_only_overrides_the_fields_it_sets() {
         // The independence guarantee: a rule that pins a color must leave
-        // opacity, title and cursor inheriting from the layers below it.
+        // opacity and cursor inheriting from the layers below it.
+        //
+        // The title is the one exception, and deliberately so: there is no
+        // layer below it to inherit *from* — an untitled folder falls through
+        // to "COSMIC Terminal", which names the program and not the place. So
+        // an enabled rule always yields a name. See [`DirRule::derived_title`].
         let mut config = Config::default();
         config.opacity = 90;
         config.syntax_theme_dark = "Global Dark".to_string();
@@ -939,7 +975,7 @@ mod tests {
             config.effective_appearance(ColorSchemeKind::Dark, None, Some(DirRuleId(1)));
         assert_eq!(appearance.syntax_theme, "Rule Dark");
         assert_eq!(appearance.opacity, 90, "opacity must still come from global");
-        assert_eq!(appearance.tab_title, None);
+        assert_eq!(appearance.tab_title.as_deref(), Some("NICO"));
         assert_eq!(appearance.cursor, None);
     }
 
@@ -1334,5 +1370,94 @@ mod tests {
             config.dir_identity(Path::new("/home/nico/flow/sub")).0.as_deref(),
             Some("POP FLOW")
         );
+    }
+
+    #[test]
+    fn a_titleless_rule_still_names_its_folder() {
+        // The case this exists for: a rule that only paints the folder. It is
+        // switched on, so the folder has an identity — it just never got a name
+        // typed into it.
+        let mut config = Config::default();
+        config.dir_rules.insert(
+            DirRuleId(1),
+            DirRule {
+                accent: Some(HexColor::rgb(0x48, 0xb9, 0xc7)),
+                ..rule("/home/nico/Pop Flow")
+            },
+        );
+
+        assert_eq!(
+            config.dir_identity(Path::new("/home/nico/Pop Flow")).0.as_deref(),
+            Some("POP FLOW")
+        );
+
+        // The window has to reach the same name by its own path, or the two
+        // surfaces disagree about one folder — which is the whole point.
+        let appearance =
+            config.effective_appearance(ColorSchemeKind::Dark, None, Some(DirRuleId(1)));
+        assert_eq!(appearance.tab_title.as_deref(), Some("POP FLOW"));
+    }
+
+    #[test]
+    fn a_written_title_outranks_the_derived_one() {
+        let mut config = Config::default();
+        config.profiles.insert(
+            ProfileId(7),
+            Profile {
+                tab_title: "From the profile".to_string(),
+                ..Default::default()
+            },
+        );
+        config.dir_rules.insert(
+            DirRuleId(1),
+            DirRule {
+                tab_title: Some("PROD".to_string()),
+                ..rule("/home/nico/Pop Flow")
+            },
+        );
+
+        let appearance = config.effective_appearance(
+            ColorSchemeKind::Dark,
+            Some(ProfileId(7)),
+            Some(DirRuleId(1)),
+        );
+        assert_eq!(appearance.tab_title.as_deref(), Some("PROD"));
+
+        // With the rule's title cleared the profile's is still a choice someone
+        // made, so it comes before a name we inferred.
+        config.dir_rules.get_mut(&DirRuleId(1)).unwrap().tab_title = None;
+        let appearance = config.effective_appearance(
+            ColorSchemeKind::Dark,
+            Some(ProfileId(7)),
+            Some(DirRuleId(1)),
+        );
+        assert_eq!(appearance.tab_title.as_deref(), Some("From the profile"));
+    }
+
+    #[test]
+    fn a_folder_with_no_name_to_derive_gets_none() {
+        // Nothing to name it after, so nothing is invented — the caller keeps
+        // whatever fallback it already had.
+        assert_eq!(rule("/").derived_title(), None);
+        assert_eq!(rule("").derived_title(), None);
+        // Relative paths never match a directory, so they never name one.
+        assert_eq!(rule("projects/prod").derived_title(), None);
+    }
+
+    #[test]
+    fn a_folder_with_no_rule_is_still_nobodys_business() {
+        // The fallback is tied to an *enabled* rule. A disabled one is parked,
+        // and a folder nobody wrote a rule for must stay unnamed.
+        let mut config = Config::default();
+        config.dir_rules.insert(
+            DirRuleId(1),
+            DirRule {
+                enabled: false,
+                ..rule("/home/nico/Pop Flow")
+            },
+        );
+
+        assert_eq!(config.dir_identity(Path::new("/home/nico/Pop Flow")).0, None);
+        assert_eq!(config.dir_identity(Path::new("/home/nico/outra")).0, None);
     }
 }
