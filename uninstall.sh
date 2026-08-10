@@ -28,10 +28,12 @@ if [ -n "$BACKUP_VER" ] && [ -n "$PKG_VER" ] && [ "$BACKUP_VER" != "$PKG_VER" ];
     [ "${POP_FLOW_ALLOW_STALE_BACKUP:-0}" = "1" ] || exit 1
 fi
 
-# Remove the auto-reapply golden copy if one was placed for cosmic-term.
-if [ -f /usr/local/lib/pop-flow/cosmic-term ]; then
-    echo "==> Removing auto-reapply golden copy (needs sudo)..."
-    sudo rm -f /usr/local/lib/pop-flow/cosmic-term
+# Turn off auto-reapply first, or the next package operation would re-patch the
+# binary right after we restore the original. Delegating to the script that owns
+# those paths rather than repeating them: this used to remove only the golden
+# copy, leaving a root-owned APT hook behind for good.
+if [ -x ./remove-auto-reapply.sh ]; then
+    ./remove-auto-reapply.sh
 fi
 
 echo "==> Restoring original /usr/bin/cosmic-term (needs sudo)..."
