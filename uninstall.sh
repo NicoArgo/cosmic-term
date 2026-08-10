@@ -5,6 +5,29 @@ cd "$(dirname "$0")"
 
 [ -f cosmic-term.orig ] || { echo "No backup (cosmic-term.orig) found."; exit 1; }
 
+# The backup was taken whenever this fork was first installed, and apt has moved
+# since on this machine before. Restoring a backup older than the package would
+# be a silent downgrade — undoing more than this script promises to undo.
+BACKUP_VER="$(./cosmic-term.orig --version 2>/dev/null | awk '{print $2}')"
+PKG_VER="$(dpkg-query -W -f='${Version}' cosmic-term 2>/dev/null | cut -d'~' -f1)"
+if [ -n "$BACKUP_VER" ] && [ -n "$PKG_VER" ] && [ "$BACKUP_VER" != "$PKG_VER" ]; then
+    echo
+    echo "!! The backup is cosmic-term $BACKUP_VER, but the package installed"
+    echo "   on this system is $PKG_VER."
+    echo
+    echo "   Restoring the backup would put $BACKUP_VER back — a downgrade, and"
+    echo "   not what 'undo the fork' should mean."
+    echo
+    echo "   Let apt restore its own binary instead, which is the real original:"
+    echo "       sudo apt install --reinstall cosmic-term"
+    echo "       rm $(pwd)/cosmic-term.orig"
+    echo
+    echo "   To restore the backup anyway, knowing the above:"
+    echo "       POP_FLOW_ALLOW_STALE_BACKUP=1 ./uninstall.sh"
+    echo
+    [ "${POP_FLOW_ALLOW_STALE_BACKUP:-0}" = "1" ] || exit 1
+fi
+
 # Remove the auto-reapply golden copy if one was placed for cosmic-term.
 if [ -f /usr/local/lib/pop-flow/cosmic-term ]; then
     echo "==> Removing auto-reapply golden copy (needs sudo)..."
