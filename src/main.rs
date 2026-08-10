@@ -185,13 +185,21 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let (config_handler, config) = match cosmic_config::Config::new(App::APP_ID, CONFIG_VERSION) {
         Ok(config_handler) => {
-            let config = match Config::get_entry(&config_handler) {
+            let mut config = match Config::get_entry(&config_handler) {
                 Ok(ok) => ok,
                 Err((errs, config)) => {
                     log::info!("errors loading config: {:?}", errs);
                     config
                 }
             };
+            // A folder's cursor color and its accent used to be two fields.
+            // Fold them before anything reads or rewrites the rules, so the
+            // colors already on disk survive the merge.
+            if config.migrate_dir_rule_colors()
+                && let Err(err) = config_handler.set("dir_rules", &config.dir_rules)
+            {
+                log::warn!("failed to save the merged folder colors: {}", err);
+            }
             (Some(config_handler), config)
         }
         Err(err) => {
@@ -513,16 +521,13 @@ pub enum Message {
     PastePrimary(Option<segmented_button::Entity>),
     PasteValue(Option<segmented_button::Entity>, String),
     DirRuleCollapse(DirRuleId),
-    DirRuleCursor(DirRuleId, String),
     DirRuleAccent(DirRuleId, String),
-    /// Drives the color picker behind a rule's cursor swatch.
+    /// Drives the color picker behind the folder-color swatch.
     ///
     /// Carries no rule id, unlike its neighbours: libcosmic wants a plain `fn`
     /// pointer for this, which cannot capture one. It does not need to — only
     /// the expanded rule has a picker, and [`App::dir_rule_expanded`] says
     /// which rule that is.
-    DirRuleCursorPicker(ColorPickerUpdate),
-    /// The same, for the folder-color swatch.
     DirRuleAccentPicker(ColorPickerUpdate),
     DirRuleEnabled(DirRuleId, bool),
     DirRuleExpand(DirRuleId),
@@ -582,16 +587,6 @@ pub enum Message {
     ZoomOut,
     ZoomReset,
     ContextMenuPopupClosed(window::Id),
-}
-
-/// Which color of a directory rule a picker is editing.
-///
-/// The two fields behave identically, so they share one set of handlers and
-/// differ only by this.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DirRuleColor {
-    Cursor,
-    Accent,
 }
 
 /// Side of the square swatch that opens a color picker, in pixels. Matches the
@@ -677,21 +672,15 @@ pub struct App {
     theme_names_light_or_inherit: Vec<String>,
     /// Rule currently expanded in the directory-rules page.
     dir_rule_expanded: Option<DirRuleId>,
-    /// In-progress text of the expanded rule's cursor field. Kept apart from the
+    /// In-progress text of the expanded rule's color field. Kept apart from the
     /// rule so a half-typed color (`#f`) can sit in the box without being
     /// rejected or committed.
-    dir_rule_cursor_text: String,
-    /// In-progress text of the expanded rule's accent field, for the same reason
-    /// as the cursor one.
     dir_rule_accent_text: String,
-    /// Picker behind the cursor field's swatch, for choosing a color instead of
+    /// Picker behind the color field's swatch, for choosing a color instead of
     /// spelling one. Only the expanded rule has one.
-    dir_rule_cursor_picker: ColorPickerModel,
-    /// The cursor color the picker opened on. The picker applies as you drag,
-    /// so without this there would be nothing for its cancel button to undo.
-    dir_rule_cursor_before: Option<HexColor>,
-    /// The accent field's picker, and the color it opened on.
     dir_rule_accent_picker: ColorPickerModel,
+    /// The color the picker opened on. The picker applies as you drag, so
+    /// without this there would be nothing for its cancel button to undo.
     dir_rule_accent_before: Option<HexColor>,
     /// Accent the window chrome is currently wearing, so the theme is only
     /// rebuilt when the answer actually changed. `None` means the system accent.
@@ -1002,31 +991,20 @@ impl App {
         self.update_accent()
     }
 
-    /// One of a rule's two colors, or `None` when that field inherits.
-    fn dir_rule_color(&self, dir_rule_id: DirRuleId, field: DirRuleColor) -> Option<HexColor> {
-        let rule = self.config.dir_rules.get(&dir_rule_id)?;
-        match field {
-            DirRuleColor::Cursor => rule.cursor,
-            DirRuleColor::Accent => rule.accent,
-        }
+    /// The rule's color, or `None` when the folder inherits.
+    fn dir_rule_color(&self, dir_rule_id: DirRuleId) -> Option<HexColor> {
+        self.config.dir_rules.get(&dir_rule_id)?.color()
     }
 
-    /// Close both color pickers and reseed them from the rule that is about to
-    /// be shown.
+    /// Close the color picker and reseed it from the rule that is about to be
+    /// shown.
     ///
     /// Called whenever the expanded rule changes: a picker left open would
     /// otherwise reappear under a different folder, still holding the previous
     /// folder's color and ready to write it there.
     fn reset_dir_rule_color_pickers(&mut self, dir_rule_id: Option<DirRuleId>) {
-        let (cursor, accent) = dir_rule_id.map_or((None, None), |id| {
-            (
-                self.dir_rule_color(id, DirRuleColor::Cursor),
-                self.dir_rule_color(id, DirRuleColor::Accent),
-            )
-        });
+        let accent = dir_rule_id.and_then(|id| self.dir_rule_color(id));
 
-        self.dir_rule_cursor_picker = dir_rule_color_picker(cursor);
-        self.dir_rule_cursor_before = cursor;
         self.dir_rule_accent_picker = dir_rule_color_picker(accent);
         self.dir_rule_accent_before = accent;
     }
@@ -1037,29 +1015,18 @@ impl App {
     /// Only the settling updates touch the rule. A drag reports a new color on
     /// every pointer move, and writing each one would rewrite the config file
     /// and rebuild the window theme dozens of times a second.
-    fn dir_rule_color_picker_update(
-        &mut self,
-        field: DirRuleColor,
-        update: ColorPickerUpdate,
-    ) -> Task<Message> {
+    fn dir_rule_color_picker_update(&mut self, update: ColorPickerUpdate) -> Task<Message> {
         let Some(dir_rule_id) = self.dir_rule_expanded else {
             return Task::none();
         };
         // Read before the picker fields are borrowed below.
-        let current = self.dir_rule_color(dir_rule_id, field);
+        let current = self.dir_rule_color(dir_rule_id);
 
-        let (picker, before, text) = match field {
-            DirRuleColor::Cursor => (
-                &mut self.dir_rule_cursor_picker,
-                &mut self.dir_rule_cursor_before,
-                &mut self.dir_rule_cursor_text,
-            ),
-            DirRuleColor::Accent => (
-                &mut self.dir_rule_accent_picker,
-                &mut self.dir_rule_accent_before,
-                &mut self.dir_rule_accent_text,
-            ),
-        };
+        let (picker, before, text) = (
+            &mut self.dir_rule_accent_picker,
+            &mut self.dir_rule_accent_before,
+            &mut self.dir_rule_accent_text,
+        );
 
         // `None` means this update did not settle on anything, so the rule is
         // left alone. `Some(None)` means it settled on inheriting.
@@ -1111,10 +1078,7 @@ impl App {
             .unwrap_or_default();
 
         if let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id) {
-            match field {
-                DirRuleColor::Cursor => rule.cursor = color,
-                DirRuleColor::Accent => rule.accent = color,
-            }
+            rule.accent = color;
         }
         self.save_dir_rules()
     }
@@ -1816,20 +1780,10 @@ impl App {
                         .into(),
                     ];
                     fields.extend(self.dir_rule_color_field(
-                        fl!("rule-cursor-color"),
-                        fl!("rule-cursor-color-description"),
-                        &self.dir_rule_cursor_text,
-                        rule.cursor,
-                        &self.dir_rule_cursor_picker,
-                        dir_rule_id,
-                        Message::DirRuleCursor,
-                        Message::DirRuleCursorPicker,
-                    ));
-                    fields.extend(self.dir_rule_color_field(
                         fl!("rule-accent-color"),
                         fl!("rule-accent-color-description"),
                         &self.dir_rule_accent_text,
-                        rule.accent,
+                        rule.color(),
                         &self.dir_rule_accent_picker,
                         dir_rule_id,
                         Message::DirRuleAccent,
@@ -2701,10 +2655,7 @@ impl Application for App {
             theme_names_dark_or_inherit: Vec::new(),
             theme_names_light_or_inherit: Vec::new(),
             dir_rule_expanded: None,
-            dir_rule_cursor_text: String::new(),
             dir_rule_accent_text: String::new(),
-            dir_rule_cursor_picker: dir_rule_color_picker(None),
-            dir_rule_cursor_before: None,
             dir_rule_accent_picker: dir_rule_color_picker(None),
             dir_rule_accent_before: None,
             applied_accent: None,
@@ -3539,18 +3490,8 @@ impl Application for App {
                 self.reset_dir_rule_color_pickers(Some(dir_rule_id));
                 // Seed the editing buffer from the rule, so the box shows what
                 // is stored rather than whatever was typed for another rule.
-                self.dir_rule_cursor_text = self
-                    .config
-                    .dir_rules
-                    .get(&dir_rule_id)
-                    .and_then(|rule| rule.cursor)
-                    .map(|cursor| cursor.display_rgb().to_string())
-                    .unwrap_or_default();
                 self.dir_rule_accent_text = self
-                    .config
-                    .dir_rules
-                    .get(&dir_rule_id)
-                    .and_then(|rule| rule.accent)
+                    .dir_rule_color(dir_rule_id)
                     .map(|accent| accent.display_rgb().to_string())
                     .unwrap_or_default();
             }
@@ -3571,7 +3512,6 @@ impl Application for App {
                     },
                 );
                 self.dir_rule_expanded = Some(dir_rule_id);
-                self.dir_rule_cursor_text = String::new();
                 self.dir_rule_accent_text = String::new();
                 self.reset_dir_rule_color_pickers(Some(dir_rule_id));
                 return self.save_dir_rules();
@@ -3648,27 +3588,10 @@ impl Application for App {
                 }
                 return self.save_dir_rules();
             }
-            Message::DirRuleCursor(dir_rule_id, text) => {
+            Message::DirRuleAccent(dir_rule_id, text) => {
                 // The text box always accepts what is typed; the rule only takes
                 // it once it is a color. Otherwise `#f` on the way to `#ff0000`
                 // would be impossible to type.
-                self.dir_rule_cursor_text = text.clone();
-                let trimmed = text.trim();
-                if trimmed.is_empty() {
-                    if let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id) {
-                        rule.cursor = None;
-                    }
-                    return self.save_dir_rules();
-                }
-                if let Ok(cursor) = trimmed.parse::<HexColor>()
-                    && let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id)
-                {
-                    rule.cursor = Some(cursor);
-                    return self.save_dir_rules();
-                }
-            }
-            Message::DirRuleAccent(dir_rule_id, text) => {
-                // Same half-typed-color dance as the cursor field above.
                 self.dir_rule_accent_text = text.clone();
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
@@ -3684,11 +3607,8 @@ impl Application for App {
                     return self.save_dir_rules();
                 }
             }
-            Message::DirRuleCursorPicker(update) => {
-                return self.dir_rule_color_picker_update(DirRuleColor::Cursor, update);
-            }
             Message::DirRuleAccentPicker(update) => {
-                return self.dir_rule_color_picker_update(DirRuleColor::Accent, update);
+                return self.dir_rule_color_picker_update(update);
             }
             Message::DirRuleSaveHere(entity_opt) => {
                 let Some(cwd) = self.terminal_working_directory(entity_opt) else {

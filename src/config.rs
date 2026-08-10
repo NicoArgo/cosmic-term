@@ -262,15 +262,21 @@ pub struct DirRule {
     /// happening in it. Without the placeholder the name replaces the program's
     /// title outright, which is how this behaved before the placeholder existed.
     pub tab_title: Option<String>,
-    pub cursor: Option<HexColor>,
-    /// The folder's identity color: the accent of the window chrome and the
-    /// stripe at the top, so a glance tells you which terminal you are in.
+    /// The folder's color — the only one it has. It paints the accent of the
+    /// window chrome, the stripe at the top, the terminal's cursor, and,
+    /// through `--resolve-rule`, whatever asks from outside (the Claude
+    /// statusline today).
     ///
-    /// Deliberately its own field rather than a color borrowed from the scheme
-    /// or the cursor. Those already have a job, and a field that means two
-    /// things is one that cannot change for one reason without breaking the
-    /// other.
+    /// One field because it is one fact. The cursor used to be picked
+    /// separately, and every rule that had one set it to the value the accent
+    /// already carried: the same decision, made twice, with two chances to
+    /// disagree.
     pub accent: Option<HexColor>,
+    /// Superseded by [`Self::accent`], and read only so that a rule written
+    /// before the two merged keeps its color — see [`Self::color`]. Never
+    /// written back: the first save after this rule is touched drops it.
+    #[serde(default, rename = "cursor", skip_serializing)]
+    pub legacy_cursor: Option<HexColor>,
 }
 
 impl Default for DirRule {
@@ -285,8 +291,8 @@ impl Default for DirRule {
             syntax_theme_light: None,
             opacity: None,
             tab_title: None,
-            cursor: None,
             accent: None,
+            legacy_cursor: None,
         }
     }
 }
@@ -325,6 +331,13 @@ pub fn render_tab_title(name: &str, program_title: Option<&str>) -> String {
 }
 
 impl DirRule {
+    /// The folder's color, wherever it happens to be written. Reading it
+    /// through here is what keeps a rule from before the merge — one that only
+    /// ever set a cursor color — from looking like a folder with no color.
+    pub fn color(&self) -> Option<HexColor> {
+        self.accent.or(self.legacy_cursor)
+    }
+
     /// The rule's path with a leading `~` expanded, or `None` when it cannot be
     /// resolved to an absolute path. A relative path has no stable meaning here
     /// — it would follow whatever directory the terminal happens to be in — so
@@ -439,10 +452,12 @@ pub struct Appearance {
     pub syntax_theme: String,
     pub opacity: u8,
     pub tab_title: Option<String>,
-    pub cursor: Option<HexColor>,
+    /// The folder's color: the window accent, the stripe, and the cursor, all
+    /// from one place.
+    ///
     /// `None` means "no folder identity here" — the window keeps the system
-    /// accent and grows no stripe, so a terminal without a rule looks exactly
-    /// like it did before rules existed.
+    /// accent, grows no stripe and keeps the color scheme's own cursor, so a
+    /// terminal without a rule looks exactly like it did before rules existed.
     pub accent: Option<HexColor>,
 }
 
@@ -725,12 +740,11 @@ impl Config {
                 // on the profile is a choice, and a choice outranks a name we
                 // inferred. See [`DirRule::derived_title`].
                 .or_else(|| rule_opt.and_then(DirRule::derived_title)),
-            cursor: rule_opt.and_then(|rule| rule.cursor),
             // Rule-only on purpose: a profile says *what to run*, and the same
             // profile is meant to be reusable across folders. Letting it carry
             // an identity color would make two folders running the same profile
             // claim the same identity.
-            accent: rule_opt.and_then(|rule| rule.accent),
+            accent: rule_opt.and_then(DirRule::color),
         }
     }
 
@@ -755,7 +769,29 @@ impl Config {
             // window heading cannot end up calling one folder two things.
             .or_else(|| rule.derived_title());
 
-        (name, rule.accent)
+        (name, rule.color())
+    }
+
+    /// Folds the old separate cursor color into the folder's single color, and
+    /// says whether anything moved.
+    ///
+    /// Needed because the old field is read but never written: without this,
+    /// the next save of an untouched rule would quietly drop a color the user
+    /// had chosen. Called once at startup, so the file is rewritten on our
+    /// terms rather than as a side effect of some unrelated edit.
+    pub fn migrate_dir_rule_colors(&mut self) -> bool {
+        let mut moved = false;
+        for rule in self.dir_rules.values_mut() {
+            if let Some(legacy) = rule.legacy_cursor.take() {
+                // A rule that set both keeps the accent: that is the one the
+                // chrome and the statusline were already showing.
+                if rule.accent.is_none() {
+                    rule.accent = Some(legacy);
+                }
+                moved = true;
+            }
+        }
+        moved
     }
 
     pub fn typed_font_stretch(&self) -> Stretch {
@@ -976,7 +1012,7 @@ mod tests {
         assert_eq!(appearance.syntax_theme, "Rule Dark");
         assert_eq!(appearance.opacity, 90, "opacity must still come from global");
         assert_eq!(appearance.tab_title.as_deref(), Some("NICO"));
-        assert_eq!(appearance.cursor, None);
+        assert_eq!(appearance.accent, None);
     }
 
     #[test]
@@ -1021,7 +1057,7 @@ mod tests {
         assert_eq!(appearance.syntax_theme, "Global Light");
         assert_eq!(appearance.opacity, 75);
         assert_eq!(appearance.tab_title, None);
-        assert_eq!(appearance.cursor, None);
+        assert_eq!(appearance.accent, None);
     }
 
     #[test]
@@ -1031,7 +1067,7 @@ mod tests {
         let written: BTreeMap<DirRuleId, DirRule> = ron::from_str(
             r##"{
                 1: (path: "~/projects", opacity: Some(85), syntax_theme_dark: Some("Dracula")),
-                2: (path: "~/projects/prod", tab_title: Some("PROD"), cursor: Some("#ff0000")),
+                2: (path: "~/projects/prod", tab_title: Some("PROD"), accent: Some("#ff0000")),
                 3: (path: "/srv", include_subdirs: true, syntax_theme_dark: Some("Solarized Dark")),
             }"##,
         )
@@ -1039,7 +1075,7 @@ mod tests {
 
         assert_eq!(written[&DirRuleId(1)].opacity, Some(85));
         assert_eq!(
-            written[&DirRuleId(2)].cursor,
+            written[&DirRuleId(2)].color(),
             Some(HexColor::rgb(0xff, 0x00, 0x00))
         );
         assert!(written[&DirRuleId(3)].include_subdirs);
@@ -1097,7 +1133,7 @@ mod tests {
         assert_eq!(pinned.syntax_theme_light.as_deref(), Some("Global Light"));
         assert_eq!(pinned.opacity, Some(72));
         assert_eq!(pinned.tab_title, None);
-        assert_eq!(pinned.cursor, None);
+        assert_eq!(pinned.accent, None);
         assert!(!pinned.include_subdirs, "pinning must not paint the subtree");
 
         // And it really is frozen: moving the global no longer moves it.
@@ -1167,7 +1203,7 @@ mod tests {
             "a folder's appearance must not spread to its children by default"
         );
         assert_eq!(rule.syntax_theme_dark, None);
-        assert_eq!(rule.cursor, None);
+        assert_eq!(rule.color(), None);
     }
 
     #[test]
@@ -1178,7 +1214,7 @@ mod tests {
             DirRule {
                 include_subdirs: false,
                 opacity: Some(70),
-                cursor: Some(HexColor::rgb(0x00, 0xff, 0x00)),
+                accent: Some(HexColor::rgb(0x00, 0xff, 0x00)),
                 tab_title: Some("prod".to_string()),
                 syntax_theme_dark: Some("Red Alert".to_string()),
                 ..rule("/srv/prod")
@@ -1220,26 +1256,72 @@ mod tests {
     }
 
     #[test]
-    fn a_rule_can_pin_a_cursor_color() {
+    fn the_folder_color_is_the_cursor_color() {
         let mut config = Config::default();
         config.dir_rules.insert(
             DirRuleId(1),
             DirRule {
-                cursor: Some(HexColor::rgb(0xff, 0x00, 0x00)),
+                accent: Some(HexColor::rgb(0xff, 0x00, 0x00)),
                 ..rule("/home/nico")
             },
         );
 
         let appearance =
             config.effective_appearance(ColorSchemeKind::Dark, None, Some(DirRuleId(1)));
-        assert_eq!(appearance.cursor, Some(HexColor::rgb(0xff, 0x00, 0x00)));
+        // One color, and the cursor is painted from it — the terminal reads
+        // this same field for both.
+        assert_eq!(appearance.accent, Some(HexColor::rgb(0xff, 0x00, 0x00)));
         // And a terminal with no rule keeps whatever its scheme says.
         assert_eq!(
             config
                 .effective_appearance(ColorSchemeKind::Dark, None, None)
-                .cursor,
+                .accent,
             None
         );
+    }
+
+    #[test]
+    fn a_rule_written_before_the_colors_merged_keeps_its_color() {
+        // Two fields became one. A rule that had only the old cursor color must
+        // still show a color, and the merge must be written back so that the
+        // next save does not drop it.
+        let mut config = Config::default();
+        let mut rules: BTreeMap<DirRuleId, DirRule> = ron::from_str(
+            r##"{
+                1: (path: "/srv/old", cursor: Some("#ffffff")),
+                2: (path: "/srv/both", cursor: Some("#111111"), accent: Some("#222222")),
+            }"##,
+        )
+        .expect("a rule from before the merge must still parse");
+        assert_eq!(
+            rules[&DirRuleId(1)].color(),
+            Some(HexColor::rgb(0xff, 0xff, 0xff))
+        );
+        // A rule that set both keeps the accent: that is the color the chrome
+        // and the statusline were already showing.
+        assert_eq!(
+            rules[&DirRuleId(2)].color(),
+            Some(HexColor::rgb(0x22, 0x22, 0x22))
+        );
+
+        config.dir_rules = std::mem::take(&mut rules);
+        assert!(config.migrate_dir_rule_colors());
+        assert_eq!(
+            config.dir_rules[&DirRuleId(1)].accent,
+            Some(HexColor::rgb(0xff, 0xff, 0xff))
+        );
+        assert_eq!(
+            config.dir_rules[&DirRuleId(2)].accent,
+            Some(HexColor::rgb(0x22, 0x22, 0x22))
+        );
+        assert!(
+            !config.migrate_dir_rule_colors(),
+            "a config that has already been merged must not keep rewriting itself"
+        );
+
+        // And the old key is gone from what we write.
+        let encoded = ron::to_string(&config.dir_rules).expect("rules must serialize");
+        assert!(!encoded.contains("cursor"));
     }
 
     #[test]

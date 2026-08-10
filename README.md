@@ -6,8 +6,8 @@ Fork of [pop-os/cosmic-term](https://github.com/pop-os/cosmic-term) for the
 ## POP Flow: appearance per directory
 
 Each folder can have its own terminal appearance — **color scheme,
-transparency, tab title, cursor color and an identity color** — persisted
-independently of the global settings and of the other folders. It applies when a
+transparency, tab title and one identity color** — persisted independently of
+the global settings and of the other folders. It applies when a
 terminal opens in that folder, and live when you `cd` into it.
 
 **A rule covers one folder.** Each directory has its own identity and does not
@@ -16,16 +16,15 @@ keeps the global appearance until it gets a rule of its own. Set
 `include_subdirs: true` on a rule when you do want it to cover a whole tree.
 
 A rule only overrides the fields it actually sets. Set a color and nothing else,
-and transparency, title and cursor keep inheriting — including from the global
-settings, so moving the global opacity still moves every folder that did not pin
-its own.
+and transparency and title keep inheriting — including from the global settings,
+so moving the global opacity still moves every folder that did not pin its own.
 
 ### Setting it up
 
 Right-click in a terminal → **Use this appearance here** pins how it looks right
 now onto the folder you are in. From there, **File → Directory rules...** opens
-the page to adjust it: color scheme, transparency, tab title, cursor, and
-whether the rule covers the folder's subtree.
+the page to adjust it: color scheme, transparency, tab title, the folder's
+color, and whether the rule covers the folder's subtree.
 
 Each field can be left inheriting, which is what keeps folders independent —
 pin a color and transparency still follows the global setting.
@@ -44,7 +43,7 @@ immediately:
 ```ron
 {
     1: (path: "~/projects", opacity: Some(85), syntax_theme_dark: Some("Dracula")),
-    2: (path: "~/projects/prod", tab_title: Some("PROD"), cursor: Some("#ff0000")),
+    2: (path: "~/projects/prod", tab_title: Some("PROD"), accent: Some("#ff0000")),
     3: (path: "/srv", include_subdirs: true, syntax_theme_dark: Some("Solarized Dark")),
 }
 ```
@@ -60,12 +59,15 @@ The key is any number, unique per rule. Fields:
 | `syntax_theme_light` | inherit | Same, for light mode. |
 | `opacity` | inherit | `0`–`100`. |
 | `tab_title` | inherit | The folder's name. `{title}` is replaced by the running program's title. |
-| `cursor` | scheme's | Cursor color, `"#rrggbb"`. |
-| `accent` | system's | The folder's identity color, `"#rrggbb"`. |
+| `accent` | inherit | The folder's color, `"#rrggbb"`: window accent, stripe, terminal cursor, and what `--resolve-rule` reports. |
+
+A rule written before the folder color and the cursor color merged still loads:
+its `cursor` is read once as the folder's color and folded into `accent` the
+next time the terminal starts.
 
 With the rules above: `~/projects` is Dracula at 85%, `~/projects/prod` is titled
-`PROD` with a red cursor (and *not* Dracula, since rule 1 stops at its own
-folder), and `~/projects/foo` looks like every other folder. Everything under
+`PROD` in red — accent, stripe and cursor (and *not* Dracula, since rule 1
+stops at its own folder), and `~/projects/foo` looks like every other folder. Everything under
 `/srv` is Solarized Dark, because rule 3 opted into its subtree.
 
 When rules do overlap — only possible once one opts into a subtree — the most

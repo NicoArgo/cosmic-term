@@ -754,7 +754,7 @@ impl Terminal {
             // rule takes part in the change detection below instead of being
             // painted on afterwards and never noticed.
             let mut target = *colors;
-            if let Some(cursor) = appearance.cursor {
+            if let Some(cursor) = appearance.accent {
                 target[NamedColor::Cursor] = Some(Rgb {
                     r: cursor.r,
                     g: cursor.g,

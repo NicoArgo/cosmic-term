@@ -30,10 +30,8 @@ include-subdirectories-description = Cover everything below this folder as well
 inherit = Inherit
 pin-opacity = Pin transparency
 pin-opacity-description = Otherwise this folder follows the global setting
-rule-cursor-color = Cursor color
-rule-cursor-color-description = Type a hex color or use the swatch. Leave empty to use the color scheme's cursor
 rule-accent-color = Folder color
-rule-accent-color-description = Tints this window's accent and adds a stripe at the top. Type a hex color or use the swatch. Leave empty to use the system accent
+rule-accent-color-description = One color for the whole folder: this window's accent, the stripe at the top, the terminal cursor, and anything asking from outside. Type a hex color or use the swatch. Leave empty to inherit
 use-appearance-here = Use this appearance here
 remove-rule-here = Remove this folder's rule
 
