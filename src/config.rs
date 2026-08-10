@@ -382,9 +382,16 @@ impl DirRule {
     /// rule covering a subtree names the folder it covers, so everything under
     /// it answers with one name instead of renaming itself on every `cd`.
     pub fn derived_title(&self) -> Option<String> {
+        self.folder_name().map(|name| name.to_uppercase())
+    }
+
+    /// The last component of the rule's path — the folder's own name, as it is
+    /// written on disk. What the rules list shows, since the full path is long,
+    /// mostly shared between rules, and already one click away in the editor.
+    pub fn folder_name(&self) -> Option<String> {
         let path = self.absolute_path()?;
         let name = path.file_name()?.to_str()?.trim();
-        (!name.is_empty()).then(|| name.to_uppercase())
+        (!name.is_empty()).then(|| name.to_string())
     }
 }
 
@@ -653,8 +660,8 @@ impl Config {
     }
 
     /// The rule already covering `path` exactly, if there is one. Used by the
-    /// "use this appearance here" action so it edits the folder's rule instead
-    /// of stacking a second one on the same directory.
+    /// "create a rule for this folder" action so it edits the folder's rule
+    /// instead of stacking a second one on the same directory.
     pub fn dir_rule_for_exact_path(&self, path: &Path) -> Option<DirRuleId> {
         self.dir_rules
             .iter()
@@ -662,22 +669,16 @@ impl Config {
             .map(|(id, _)| *id)
     }
 
-    /// A rule that pins how a terminal looks *right now*.
+    /// A fresh rule for a folder, carrying nothing but the folder.
     ///
-    /// Backs "use this appearance here": the point is to freeze the current
-    /// look for this folder, so later changes to the global settings stop
-    /// moving it. Only the colors and transparency are captured — a title and a
-    /// cursor are things you choose, not things the terminal currently "has".
-    pub fn dir_rule_from_current(
-        &self,
-        path: String,
-        profile_id_opt: Option<ProfileId>,
-    ) -> DirRule {
+    /// It used to freeze the current color scheme and transparency too. Those
+    /// left the dialog, and a rule that silently pins settings nothing on
+    /// screen can show or undo is worse than no rule: the folder would quietly
+    /// stop following the global theme with no way back. What is left is the
+    /// identity — name and color — which is what the rule is for.
+    pub fn dir_rule_from_current(&self, path: String) -> DirRule {
         DirRule {
             path,
-            syntax_theme_dark: Some(self.syntax_theme(ColorSchemeKind::Dark, profile_id_opt).0),
-            syntax_theme_light: Some(self.syntax_theme(ColorSchemeKind::Light, profile_id_opt).0),
-            opacity: Some(self.opacity),
             ..Default::default()
         }
     }
@@ -1119,43 +1120,48 @@ mod tests {
     }
 
     #[test]
-    fn pinning_the_current_appearance_captures_colors_and_opacity_only() {
-        // The point is to freeze how the terminal looks now, so later changes to
-        // the global settings stop moving this folder. A title and a cursor are
-        // things you choose, not things it currently "has".
+    fn a_new_rule_carries_the_folder_and_nothing_else() {
+        // Making a rule for a folder must not quietly freeze the theme and the
+        // transparency it happens to have right now: the dialog no longer shows
+        // either, so a rule that pinned them could never be unpinned.
         let mut config = Config::default();
         config.opacity = 72;
         config.syntax_theme_dark = "Global Dark".to_string();
         config.syntax_theme_light = "Global Light".to_string();
 
-        let pinned = config.dir_rule_from_current("/srv".to_string(), None);
-        assert_eq!(pinned.syntax_theme_dark.as_deref(), Some("Global Dark"));
-        assert_eq!(pinned.syntax_theme_light.as_deref(), Some("Global Light"));
-        assert_eq!(pinned.opacity, Some(72));
-        assert_eq!(pinned.tab_title, None);
-        assert_eq!(pinned.accent, None);
-        assert!(!pinned.include_subdirs, "pinning must not paint the subtree");
+        let fresh = config.dir_rule_from_current("/srv".to_string());
+        assert_eq!(fresh.syntax_theme_dark, None);
+        assert_eq!(fresh.syntax_theme_light, None);
+        assert_eq!(fresh.opacity, None);
+        assert_eq!(fresh.tab_title, None);
+        assert_eq!(fresh.accent, None);
+        assert!(fresh.enabled);
+        assert!(!fresh.include_subdirs, "a rule must not paint the subtree");
 
-        // And it really is frozen: moving the global no longer moves it.
-        config.opacity = 30;
-        config.dir_rules.insert(DirRuleId(1), pinned);
+        // So the folder keeps following the global settings until it is given
+        // something of its own.
+        config.dir_rules.insert(DirRuleId(1), fresh);
         assert_eq!(config.effective_opacity(Some(DirRuleId(1))), 72);
+        config.opacity = 30;
+        assert_eq!(config.effective_opacity(Some(DirRuleId(1))), 30);
     }
 
     #[test]
-    fn pinning_captures_the_profiles_colors_when_there_is_one() {
-        let mut config = Config::default();
-        config.syntax_theme_dark = "Global Dark".to_string();
-        config.profiles.insert(
-            ProfileId(1),
-            Profile {
-                syntax_theme_dark: "Profile Dark".to_string(),
-                ..Default::default()
-            },
+    fn the_rules_list_shows_the_folder_name_alone() {
+        // The list is a set of identities, not a set of paths — and the paths in
+        // it are long and mostly identical to each other.
+        assert_eq!(
+            rule("/home/nico/Apps Workspace/Pop Flow").folder_name().as_deref(),
+            Some("Pop Flow")
         );
-
-        let pinned = config.dir_rule_from_current("/srv".to_string(), Some(ProfileId(1)));
-        assert_eq!(pinned.syntax_theme_dark.as_deref(), Some("Profile Dark"));
+        // The title derived for an unnamed folder is the same name, shouted.
+        assert_eq!(
+            rule("/home/nico/Apps Workspace/Pop Flow").derived_title().as_deref(),
+            Some("POP FLOW")
+        );
+        // A path that names no folder has no name to show; the caller falls
+        // back to the path it was given.
+        assert_eq!(rule("/").folder_name(), None);
     }
 
     #[test]

@@ -533,15 +533,12 @@ pub enum Message {
     DirRuleExpand(DirRuleId),
     DirRuleIncludeSubdirs(DirRuleId, bool),
     DirRuleNew,
-    DirRuleOpacity(DirRuleId, u8),
-    DirRuleOpacityPinned(DirRuleId, bool),
     DirRulePath(DirRuleId, String),
     DirRuleRemove(DirRuleId),
     /// Pin the active terminal's current appearance to the folder it is in.
     DirRuleSaveHere(Option<segmented_button::Entity>),
     /// Drop the rule covering the active terminal's folder.
     DirRuleRemoveHere(Option<segmented_button::Entity>),
-    DirRuleSyntaxTheme(DirRuleId, ColorSchemeKind, usize),
     DirRuleTabTitle(DirRuleId, String),
     DirRuleUseCurrentDirectory(DirRuleId),
     ProfileCollapse(ProfileId),
@@ -1640,14 +1637,23 @@ impl App {
                 };
 
                 let expanded = self.dir_rule_expanded == Some(dir_rule_id);
-                let label = if rule_path.is_empty() {
-                    fl!("rule-path-unset")
-                } else {
-                    rule_path
-                };
+                // The folder's own name, not the whole path: the paths are long,
+                // mostly identical to each other, and the full one is right
+                // there in the editor below. Painted in the folder's color, so
+                // the list reads as the set of identities it is.
+                let label = rule
+                    .folder_name()
+                    .or_else(|| (!rule_path.is_empty()).then_some(rule_path))
+                    .unwrap_or_else(|| fl!("rule-path-unset"));
+                let mut label = widget::text::body(label);
+                if let Some(color) = rule.color() {
+                    label = label.class(theme::Text::Color(hex_to_color(color)));
+                }
 
                 rules_section = rules_section.add(
-                    widget::settings::item::builder(label).control(
+                    widget::settings::item_row(vec![
+                        label.into(),
+                        widget::space::horizontal().into(),
                         widget::row::with_children(vec![
                             widget::button::custom(icon_cache_get("edit-delete-symbolic", 16))
                                 .on_press(Message::DirRuleRemove(dir_rule_id))
@@ -1664,26 +1670,12 @@ impl App {
                             .into(),
                         ])
                         .align_y(Alignment::Center)
-                        .spacing(space_xxs),
-                    ),
+                        .spacing(space_xxs)
+                        .into(),
+                    ]),
                 );
 
                 if expanded {
-                    // Index 0 is "inherit", so an unset scheme selects the first
-                    // entry rather than showing an empty dropdown.
-                    let dark_selected = Some(rule.syntax_theme_dark.as_ref().map_or(0, |name| {
-                        self.theme_names_dark
-                            .iter()
-                            .position(|n| n == name)
-                            .map_or(0, |i| i + 1)
-                    }));
-                    let light_selected = Some(rule.syntax_theme_light.as_ref().map_or(0, |name| {
-                        self.theme_names_light
-                            .iter()
-                            .position(|n| n == name)
-                            .map_or(0, |i| i + 1)
-                    }));
-
                     let mut expanded_section = widget::settings::section()
                         .add(
                             widget::column::with_children(vec![
@@ -1712,58 +1704,7 @@ impl App {
                                 .control(widget::toggler(rule.include_subdirs).on_toggle(
                                     move |value| Message::DirRuleIncludeSubdirs(dir_rule_id, value),
                                 )),
-                        )
-                        .add(
-                            widget::settings::item::builder(fl!("syntax-dark")).control(
-                                widget::dropdown::popup_dropdown(
-                                    &self.theme_names_dark_or_inherit,
-                                    dark_selected,
-                                    move |theme_i| {
-                                        Message::DirRuleSyntaxTheme(
-                                            dir_rule_id,
-                                            ColorSchemeKind::Dark,
-                                            theme_i,
-                                        )
-                                    },
-                                    self.core.main_window_id().unwrap_or(window::Id::RESERVED),
-                                    Message::Surface,
-                                    |a| a,
-                                ),
-                            ),
-                        )
-                        .add(
-                            widget::settings::item::builder(fl!("syntax-light")).control(
-                                widget::dropdown(
-                                    &self.theme_names_light_or_inherit,
-                                    light_selected,
-                                    move |theme_i| {
-                                        Message::DirRuleSyntaxTheme(
-                                            dir_rule_id,
-                                            ColorSchemeKind::Light,
-                                            theme_i,
-                                        )
-                                    },
-                                ),
-                            ),
-                        )
-                        .add(
-                            widget::settings::item::builder(fl!("pin-opacity"))
-                                .description(fl!("pin-opacity-description"))
-                                .control(widget::toggler(rule.opacity.is_some()).on_toggle(
-                                    move |value| Message::DirRuleOpacityPinned(dir_rule_id, value),
-                                )),
                         );
-
-                    // Only worth showing once the folder actually pins one.
-                    if let Some(opacity) = rule.opacity {
-                        expanded_section = expanded_section.add(
-                            widget::settings::item::builder(fl!("opacity"))
-                                .description(format!("{opacity}%"))
-                                .control(widget::slider(0..=100, opacity, move |value| {
-                                    Message::DirRuleOpacity(dir_rule_id, value)
-                                })),
-                        );
-                    }
 
                     let mut fields: Vec<Element<'_, Message>> = vec![
                         widget::text(fl!("tab-title")).into(),
@@ -3550,37 +3491,6 @@ impl Application for App {
                 }
                 return self.save_dir_rules();
             }
-            Message::DirRuleSyntaxTheme(dir_rule_id, color_scheme_kind, theme_i) => {
-                // Index 0 is the "inherit" entry, so the rest are offset by one.
-                let theme_name = theme_i.checked_sub(1).and_then(|i| {
-                    match color_scheme_kind {
-                        ColorSchemeKind::Dark => self.theme_names_dark.get(i),
-                        ColorSchemeKind::Light => self.theme_names_light.get(i),
-                    }
-                    .cloned()
-                });
-                if let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id) {
-                    match color_scheme_kind {
-                        ColorSchemeKind::Dark => rule.syntax_theme_dark = theme_name,
-                        ColorSchemeKind::Light => rule.syntax_theme_light = theme_name,
-                    }
-                }
-                return self.save_dir_rules();
-            }
-            Message::DirRuleOpacityPinned(dir_rule_id, pinned) => {
-                if let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id) {
-                    // Start from the global value, so pinning does not jump the
-                    // folder to some unrelated number before it is adjusted.
-                    rule.opacity = pinned.then_some(self.config.opacity);
-                }
-                return self.save_dir_rules();
-            }
-            Message::DirRuleOpacity(dir_rule_id, opacity) => {
-                if let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id) {
-                    rule.opacity = Some(cmp::min(100, opacity));
-                }
-                return self.save_dir_rules();
-            }
             Message::DirRuleTabTitle(dir_rule_id, title) => {
                 if let Some(rule) = self.config.dir_rules.get_mut(&dir_rule_id) {
                     // Empty means "inherit" rather than "an empty title".
@@ -3612,20 +3522,11 @@ impl Application for App {
             }
             Message::DirRuleSaveHere(entity_opt) => {
                 let Some(cwd) = self.terminal_working_directory(entity_opt) else {
-                    log::warn!("cannot pin an appearance: no working directory for this terminal");
+                    log::warn!("cannot create a rule: no working directory for this terminal");
                     return Task::none();
                 };
-                let profile_id_opt = self
-                    .pane_model
-                    .active()
-                    .and_then(|tab_model| {
-                        let entity = entity_opt.unwrap_or_else(|| tab_model.active());
-                        tab_model.data::<Mutex<Terminal>>(entity)
-                    })
-                    .and_then(|terminal| terminal.lock().unwrap().profile_id_opt);
 
                 let path = cwd.to_string_lossy().into_owned();
-                let rule = self.config.dir_rule_from_current(path, profile_id_opt);
                 // Edit the folder's existing rule rather than stacking a second
                 // one on the same directory, which would leave a dead entry the
                 // resolver ignores.
@@ -3634,16 +3535,24 @@ impl Application for App {
                     .dir_rule_for_exact_path(&cwd)
                     .unwrap_or_else(|| self.config.next_dir_rule_id());
                 match self.config.dir_rules.get_mut(&dir_rule_id) {
-                    Some(existing) => {
-                        existing.syntax_theme_dark = rule.syntax_theme_dark;
-                        existing.syntax_theme_light = rule.syntax_theme_light;
-                        existing.opacity = rule.opacity;
-                        existing.enabled = true;
-                    }
+                    // The folder already has a rule: waking a parked one is the
+                    // only thing left to do, since the name and the color are
+                    // the user's to choose and not ours to overwrite.
+                    Some(existing) => existing.enabled = true,
                     None => {
-                        self.config.dir_rules.insert(dir_rule_id, rule);
+                        self.config
+                            .dir_rules
+                            .insert(dir_rule_id, self.config.dir_rule_from_current(path));
                     }
                 }
+                // Open it, so the rule that was just made is the one on screen
+                // waiting for a name and a color.
+                self.dir_rule_expanded = Some(dir_rule_id);
+                self.dir_rule_accent_text = self
+                    .dir_rule_color(dir_rule_id)
+                    .map(|accent| accent.display_rgb().to_string())
+                    .unwrap_or_default();
+                self.reset_dir_rule_color_pickers(Some(dir_rule_id));
                 return self.save_dir_rules();
             }
             Message::DirRuleRemoveHere(entity_opt) => {

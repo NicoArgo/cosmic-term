@@ -5,10 +5,13 @@ Fork of [pop-os/cosmic-term](https://github.com/pop-os/cosmic-term) for the
 
 ## POP Flow: appearance per directory
 
-Each folder can have its own terminal appearance — **color scheme,
-transparency, tab title and one identity color** — persisted independently of
-the global settings and of the other folders. It applies when a
-terminal opens in that folder, and live when you `cd` into it.
+Each folder can have an identity of its own — **a name and a color** —
+persisted independently of the global settings and of the other folders. It
+applies when a terminal opens in that folder, and live when you `cd` into it.
+
+The color scheme and the transparency can also be pinned per folder, but only
+by editing the rules file: they were taken out of the dialog, which is about
+telling one project's terminals from another's, not about re-theming each one.
 
 **A rule covers one folder.** Each directory has its own identity and does not
 hand it down: a rule on `~/projects` says nothing about `~/projects/foo`, which
@@ -16,18 +19,20 @@ keeps the global appearance until it gets a rule of its own. Set
 `include_subdirs: true` on a rule when you do want it to cover a whole tree.
 
 A rule only overrides the fields it actually sets. Set a color and nothing else,
-and transparency and title keep inheriting — including from the global settings,
+and title and transparency keep inheriting — including from the global settings,
 so moving the global opacity still moves every folder that did not pin its own.
 
 ### Setting it up
 
-Right-click in a terminal → **Use this appearance here** pins how it looks right
-now onto the folder you are in. From there, **File → Directory rules...** opens
-the page to adjust it: color scheme, transparency, tab title, the folder's
-color, and whether the rule covers the folder's subtree.
+Right-click in a terminal → **Create a rule for this folder** makes a rule for
+the folder you are in and opens it, ready to be named and colored. It captures
+nothing else: a folder keeps following the global theme until you tell it not
+to. **File → Directory rules...** reopens the page later.
 
-Each field can be left inheriting, which is what keeps folders independent —
-pin a color and transparency still follows the global setting.
+The list shows each folder by name — in its own color — rather than by path;
+the full path is in the rule's own editor.
+
+Each field can be left inheriting, which is what keeps folders independent.
 
 ### Editing the rules file directly
 
@@ -55,9 +60,9 @@ The key is any number, unique per rule. Fields:
 | `path` | — | Absolute, or starting with `~`. Required. |
 | `include_subdirs` | `false` | Opt in to covering everything below `path` too. |
 | `enabled` | `true` | Lets a rule be parked instead of deleted. |
-| `syntax_theme_dark` | inherit | Color scheme name, as shown in *View → Color schemes*. |
-| `syntax_theme_light` | inherit | Same, for light mode. |
-| `opacity` | inherit | `0`–`100`. |
+| `syntax_theme_dark` | inherit | Color scheme name, as shown in *View → Color schemes*. File only. |
+| `syntax_theme_light` | inherit | Same, for light mode. File only. |
+| `opacity` | inherit | `0`–`100`. File only. |
 | `tab_title` | inherit | The folder's name. `{title}` is replaced by the running program's title. |
 | `accent` | inherit | The folder's color, `"#rrggbb"`: window accent, stripe, terminal cursor, and what `--resolve-rule` reports. |
 

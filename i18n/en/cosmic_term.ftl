@@ -19,7 +19,7 @@ import-errors = Import errors
 
 ## Directory rules
 directory-rules = Directory rules...
-directory-rules-description = Give a folder its own look. A rule covers that one folder — the folders inside it keep the global appearance until they get rules of their own.
+directory-rules-description = Give a folder a name and a color of its own, so you can tell its terminals apart at a glance. A rule covers that one folder — the folders inside it keep the global appearance until they get rules of their own.
 add-rule = Add rule
 rule-path = Folder
 rule-path-unset = (no folder set)
@@ -28,11 +28,9 @@ use-current-directory = Use current folder
 include-subdirectories = Include subfolders
 include-subdirectories-description = Cover everything below this folder as well
 inherit = Inherit
-pin-opacity = Pin transparency
-pin-opacity-description = Otherwise this folder follows the global setting
 rule-accent-color = Folder color
 rule-accent-color-description = One color for the whole folder: this window's accent, the stripe at the top, the terminal cursor, and anything asking from outside. Type a hex color or use the swatch. Leave empty to inherit
-use-appearance-here = Use this appearance here
+use-appearance-here = Create a rule for this folder
 remove-rule-here = Remove this folder's rule
 
 ## Color picker

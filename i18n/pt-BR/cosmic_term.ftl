@@ -23,7 +23,7 @@ import-errors = Erros de Importação
 ## Directory rules
 
 directory-rules = Regras por pasta...
-directory-rules-description = Dê a uma pasta a sua própria aparência. A regra vale para aquela pasta — as de dentro dela seguem com a aparência global até ganharem regra própria.
+directory-rules-description = Dê a uma pasta um nome e uma cor próprios, para reconhecer os terminais dela de relance. A regra vale para aquela pasta — as de dentro dela seguem com a aparência global até ganharem regra própria.
 add-rule = Adicionar regra
 rule-path = Pasta
 rule-path-unset = (nenhuma pasta definida)
@@ -32,11 +32,9 @@ use-current-directory = Usar a pasta atual
 include-subdirectories = Incluir subpastas
 include-subdirectories-description = Cobrir também tudo o que estiver abaixo desta pasta
 inherit = Herdar
-pin-opacity = Fixar transparência
-pin-opacity-description = Sem isso, a pasta segue o ajuste global
 rule-accent-color = Cor da pasta
 rule-accent-color-description = Uma cor para a pasta inteira: o acento desta janela, a faixa no topo, o cursor do terminal e quem perguntar de fora. Digite um hexadecimal ou escolha no seletor de cor ao lado. Deixe vazio para herdar
-use-appearance-here = Usar esta aparência aqui
+use-appearance-here = Criar regra para esta pasta
 remove-rule-here = Remover a regra desta pasta
 
 ## Color picker
