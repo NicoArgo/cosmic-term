@@ -773,6 +773,50 @@ impl Config {
         (name, rule.color())
     }
 
+    /// Give `dir` a name and a color from outside the terminal — the file
+    /// manager's "Folder rule" dialog, through `--set-rule`.
+    ///
+    /// Edits the folder's own rule when it has one, leaving everything else that
+    /// rule pins (opacity, syntax themes) as it was: the caller only knows about
+    /// the identity, and must not reset what it cannot see. Otherwise adds a
+    /// rule. An empty name means "no name of its own", which falls back to the
+    /// folder's, same as leaving the field blank in the settings.
+    pub fn set_dir_identity(
+        &mut self,
+        dir: &Path,
+        name: Option<String>,
+        accent: Option<HexColor>,
+        include_subdirs: bool,
+    ) {
+        let name = name.filter(|name| !name.trim().is_empty());
+        let id = self
+            .dir_rule_for_exact_path(dir)
+            .unwrap_or_else(|| self.next_dir_rule_id());
+        let rule = self
+            .dir_rules
+            .entry(id)
+            .or_insert_with(|| DirRule {
+                path: dir.to_string_lossy().into_owned(),
+                ..Default::default()
+            });
+        rule.tab_title = name;
+        rule.accent = accent;
+        rule.legacy_cursor = None;
+        rule.include_subdirs = include_subdirs;
+        rule.enabled = true;
+    }
+
+    /// Drop the rule set on `dir` itself. Rules on its parents are untouched,
+    /// even ones that reach it through `include_subdirs`: removing *this*
+    /// folder's rule is what was asked, not repainting its whole family.
+    /// Returns whether there was one.
+    pub fn remove_dir_rule_for(&mut self, dir: &Path) -> bool {
+        match self.dir_rule_for_exact_path(dir) {
+            Some(id) => self.dir_rules.remove(&id).is_some(),
+            None => false,
+        }
+    }
+
     /// Folds the old separate cursor color into the folder's single color, and
     /// says whether anything moved.
     ///
@@ -1428,6 +1472,66 @@ mod tests {
         let (name, accent) = config.dir_identity(Path::new("/home/nico/outra"));
         assert_eq!(name, None);
         assert_eq!(accent, None);
+    }
+
+    #[test]
+    fn set_dir_identity_edits_the_folders_rule_and_keeps_the_rest() {
+        let mut config = Config::default();
+        config.dir_rules.insert(
+            DirRuleId(3),
+            DirRule {
+                opacity: Some(80),
+                tab_title: Some("Velho".to_string()),
+                ..rule("/home/nico/flow/")
+            },
+        );
+
+        config.set_dir_identity(
+            Path::new("/home/nico/flow"),
+            Some("Novo".to_string()),
+            Some(HexColor::rgb(1, 2, 3)),
+            true,
+        );
+
+        // Same rule (a trailing slash is the same folder), not a second one.
+        assert_eq!(config.dir_rules.len(), 1);
+        let rule = &config.dir_rules[&DirRuleId(3)];
+        assert_eq!(rule.tab_title.as_deref(), Some("Novo"));
+        assert_eq!(rule.accent, Some(HexColor::rgb(1, 2, 3)));
+        assert!(rule.include_subdirs);
+        // What the caller could not see stays as it was.
+        assert_eq!(rule.opacity, Some(80));
+    }
+
+    #[test]
+    fn set_dir_identity_adds_a_rule_after_the_last_id() {
+        let mut config = Config::default();
+        config.dir_rules.insert(DirRuleId(7), rule("/home/nico/a"));
+
+        config.set_dir_identity(Path::new("/home/nico/b"), Some("  ".to_string()), None, false);
+
+        let rule = &config.dir_rules[&DirRuleId(8)];
+        assert_eq!(rule.path, "/home/nico/b");
+        // A blank name is no name: the folder's own takes over.
+        assert_eq!(rule.tab_title, None);
+        assert!(rule.enabled);
+    }
+
+    #[test]
+    fn remove_dir_rule_for_only_touches_that_folder() {
+        let mut config = Config::default();
+        config.dir_rules.insert(
+            DirRuleId(1),
+            DirRule {
+                include_subdirs: true,
+                ..rule("/home/nico")
+            },
+        );
+        config.dir_rules.insert(DirRuleId(2), rule("/home/nico/flow"));
+
+        assert!(config.remove_dir_rule_for(Path::new("/home/nico/flow")));
+        assert!(!config.remove_dir_rule_for(Path::new("/home/nico/flow")));
+        assert_eq!(config.dir_rules.keys().copied().collect::<Vec<_>>(), [DirRuleId(1)]);
     }
 
     #[test]

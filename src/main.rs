@@ -12,7 +12,7 @@ use cosmic::widget::segmented_button::ReorderEvent;
 use cosmic::{
     Application, ApplicationExt, Element, action,
     app::{Core, Settings, Task, context_drawer},
-    cosmic_config::{self, ConfigSet, CosmicConfigEntry},
+    cosmic_config::{self, ConfigGet, ConfigSet, CosmicConfigEntry},
     cosmic_theme::{self, palette::Srgba},
     executor,
     iced::{
@@ -148,6 +148,61 @@ fn main() -> Result<(), Box<dyn Error>> {
                 eprintln!("Missing argument for {arg_str}");
                 process::exit(1);
             }
+            Some(arg_str @ ("--set-rule" | "--remove-rule")) => {
+                // Same reasoning as `--resolve-rule`: the file manager asks this
+                // from a context menu, with no terminal on screen and no wish
+                // for one. The rule is written here so the terminal stays the
+                // only program that knows what a rule looks like on disk.
+                let Some(dir_arg) = raw_args.next_os(&mut cursor) else {
+                    eprintln!("Missing argument for {arg_str}");
+                    process::exit(1);
+                };
+                let dir = absolute_dir(Path::new(&dir_arg));
+                let result = if arg_str == "--remove-rule" {
+                    edit_dir_rules_on_disk(|config| {
+                        config.remove_dir_rule_for(&dir);
+                    })
+                } else {
+                    let mut name = None;
+                    let mut accent = None;
+                    let mut include_subdirs = false;
+                    while let Some(opt) = raw_args.next_os(&mut cursor) {
+                        match opt.to_str() {
+                            Some("--subdirs") => include_subdirs = true,
+                            Some(opt @ ("--name" | "--accent")) => {
+                                let Some(value) = raw_args.next_os(&mut cursor) else {
+                                    eprintln!("Missing value for {opt}");
+                                    process::exit(1);
+                                };
+                                let value = value.to_string_lossy().into_owned();
+                                if opt == "--name" {
+                                    name = Some(value);
+                                } else if !value.trim().is_empty() {
+                                    match HexColor::parse_rgb(value.trim()) {
+                                        Ok(color) => accent = Some(color),
+                                        Err(err) => {
+                                            eprintln!("Invalid color {value:?}: {err}");
+                                            process::exit(1);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                eprintln!("Unknown option for {arg_str}: {opt:?}");
+                                process::exit(1);
+                            }
+                        }
+                    }
+                    edit_dir_rules_on_disk(|config| {
+                        config.set_dir_identity(&dir, name, accent, include_subdirs);
+                    })
+                };
+                if let Err(err) = result {
+                    eprintln!("{err}");
+                    process::exit(1);
+                }
+                return Ok(());
+            }
             Some("-e") | Some("--command") | Some("--") => {
                 // Handle the '--command' or '-e' flag
                 break;
@@ -260,7 +315,11 @@ Options:
   --version                       Show the version of cosmic-term
   -w, --working-directory <dir>   Set the working directory for the terminal
   --resolve-rule <dir>            Print the directory rule's name and accent as
-                                  shell assignments, for prompts and status bars"#
+                                  shell assignments, for prompts and status bars
+  --set-rule <dir> [--name <text>] [--accent <#rrggbb>] [--subdirs]
+                                  Give a folder a name and color (edits its rule,
+                                  or creates one), then exit
+  --remove-rule <dir>             Remove the rule set on that folder, then exit"#
     );
 }
 
@@ -304,19 +363,50 @@ fn shell_assignments(name: Option<&str>, accent: Option<HexColor>) -> String {
     out
 }
 
+/// A relative path has no stable meaning to a rule, so anchor it the way the
+/// caller would read it — against the process's own directory.
+fn absolute_dir(dir: &Path) -> PathBuf {
+    if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        env::current_dir().unwrap_or_default().join(dir)
+    }
+}
+
+/// Load the rules from disk, change them, and write them back — for the
+/// `--set-rule`/`--remove-rule` callers, which have no running terminal.
+///
+/// Only the `dir_rules` key is read and written, so a broken unrelated setting
+/// cannot stop this. A `dir_rules` that fails to parse, though, refuses the
+/// edit: carrying on from "no rules" would write that back over every rule
+/// the file still holds.
+fn edit_dir_rules_on_disk(edit: impl FnOnce(&mut Config)) -> Result<(), String> {
+    let handler = cosmic_config::Config::new(App::APP_ID, CONFIG_VERSION)
+        .map_err(|err| format!("failed to open the terminal config: {err}"))?;
+    let dir_rules = match handler.get_local("dir_rules") {
+        Ok(dir_rules) => dir_rules,
+        Err(cosmic_config::Error::NotFound) => BTreeMap::new(),
+        Err(err) => return Err(format!("not editing unreadable folder rules: {err}")),
+    };
+    let mut config = Config {
+        dir_rules,
+        ..Config::default()
+    };
+    // A rule still carrying the old cursor field would lose it on this write.
+    config.migrate_dir_rule_colors();
+    edit(&mut config);
+    handler
+        .set("dir_rules", &config.dir_rules)
+        .map_err(|err| format!("failed to save folder rules: {err}"))
+}
+
 /// Look up a directory's rule and render it as shell assignments.
 ///
 /// Reads the config directly instead of asking a running terminal: there may be
 /// no terminal open on that folder, and a status bar asking about a directory is
 /// a question about configuration, not about any particular window.
 fn resolve_rule_for_shell(dir: &Path) -> String {
-    // A relative path has no stable meaning to a rule, so anchor it the way the
-    // caller would read it — against the process's own directory.
-    let dir = if dir.is_absolute() {
-        dir.to_path_buf()
-    } else {
-        env::current_dir().unwrap_or_default().join(dir)
-    };
+    let dir = absolute_dir(dir);
 
     let config = match cosmic_config::Config::new(App::APP_ID, CONFIG_VERSION) {
         // Partial config still answers this question: a broken unrelated key
