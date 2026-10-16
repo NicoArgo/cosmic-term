@@ -344,6 +344,14 @@ impl Terminal {
         )));
 
         let window_id = 0;
+        // Where the shell starts: the directory asked for, or this process's
+        // own, which the shell inherits. Known up front so the cached cwd is
+        // never "nothing yet" — a config reload re-resolves rules from it, and
+        // an empty cache would strip the rule the terminal started with.
+        let start_dir = options
+            .working_directory
+            .clone()
+            .or_else(|| std::env::current_dir().ok());
         let pty = tty::new(&options, size.into(), window_id)?;
         #[cfg(not(windows))]
         let shell_pid = Some(pty.child().id());
@@ -374,7 +382,7 @@ impl Terminal {
             dir_rule_id_opt,
             search_regex_opt: None,
             search_value: String::new(),
-            cwd: None,
+            cwd: start_dir,
             cwd_polled_at: Instant::now(),
             shell_pid,
             size,

@@ -756,8 +756,15 @@ impl Config {
     /// not a terminal has no program title to substitute, and leaking the raw
     /// placeholder into a status bar would be worse than dropping it.
     pub fn dir_identity(&self, dir: &Path) -> (Option<String>, Option<HexColor>) {
-        let Some(rule) = resolve_dir_rule(&self.dir_rules, dir).and_then(|id| self.dir_rules.get(&id))
-        else {
+        match resolve_dir_rule(&self.dir_rules, dir) {
+            Some(id) => self.dir_rule_identity(id),
+            None => (None, None),
+        }
+    }
+
+    /// The name and color of one rule, as [`Config::dir_identity`] reports them.
+    pub fn dir_rule_identity(&self, id: DirRuleId) -> (Option<String>, Option<HexColor>) {
+        let Some(rule) = self.dir_rules.get(&id) else {
             return (None, None);
         };
 

@@ -83,6 +83,7 @@ mod terminal_box;
 
 #[cfg(feature = "password_manager")]
 mod password_manager;
+mod presence;
 mod terminal_theme;
 
 mod dnd;
@@ -299,7 +300,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     // Run the cosmic app
-    cosmic::app::run::<App>(settings, flags)?;
+    let result = cosmic::app::run::<App>(settings, flags);
+    presence::remove();
+    result?;
 
     Ok(())
 }
@@ -784,6 +787,9 @@ pub struct App {
     /// Accent the window chrome is currently wearing, so the theme is only
     /// rebuilt when the answer actually changed. `None` means the system accent.
     applied_accent: Option<HexColor>,
+    /// What this window last told the panel, so an unchanged title is not
+    /// rewritten on every prompt.
+    published_presence: Option<presence::Presence>,
     themes: HashMap<(String, ColorSchemeKind), TermColors>,
     context_page: ContextPage,
     dialog_opt: Option<Dialog<Message>>,
@@ -1290,6 +1296,44 @@ impl App {
         self.config.dir_rules.get(&dir_rule_id)?.accent
     }
 
+    /// The folder identity of the terminal in front: its rule's name and color.
+    fn active_dir_identity(&self) -> (Option<String>, Option<HexColor>) {
+        if self.config.dir_rules.is_empty() {
+            return (None, None);
+        }
+        let Some(tab_model) = self.pane_model.panes.get(self.pane_model.focused()) else {
+            return (None, None);
+        };
+        let Some(terminal) = tab_model.data::<Mutex<Terminal>>(tab_model.active()) else {
+            return (None, None);
+        };
+        // The rule the terminal already wears, not one resolved again from the
+        // cwd: the first poll of the cwd comes later than the first title.
+        match terminal.lock().unwrap().dir_rule_id_opt {
+            Some(id) => self.config.dir_rule_identity(id),
+            None => (None, None),
+        }
+    }
+
+    /// Tell the panel's terminal applet what this window is now called and
+    /// which color it wears. Rides on `update_title`, which every change of
+    /// title, tab or folder rule already goes through.
+    fn publish_presence(&mut self, title: String) {
+        let (name, accent) = self.active_dir_identity();
+        let presence = presence::Presence {
+            title,
+            name,
+            accent,
+        };
+        if self.published_presence.as_ref() == Some(&presence) {
+            return;
+        }
+        if let Err(err) = presence::write(&presence) {
+            log::warn!("failed to publish window presence: {err}");
+        }
+        self.published_presence = Some(presence);
+    }
+
     /// Repaint the window chrome in the active folder's accent, if that is not
     /// already the color it is wearing.
     ///
@@ -1345,6 +1389,7 @@ impl App {
                 None => (String::new(), fl!("cosmic-terminal")),
             };
             self.set_header_title(header_title);
+            self.publish_presence(window_title.clone());
             Task::batch([
                 if let Some(window_id) = self.core.main_window_id() {
                     self.set_window_title(window_title, window_id)
@@ -2450,13 +2495,15 @@ impl App {
                             };
 
                             // The rule for the directory this terminal starts
-                            // in. When the shell just inherits the process cwd
-                            // there is nothing to resolve from here; the live
-                            // check picks the folder up on the first prompt.
+                            // in. With no directory given the shell inherits
+                            // this process's cwd, so that is the folder to
+                            // resolve: the live check alone would miss it, since
+                            // the first prompt lands inside its 200 ms throttle.
                             let dir_rule_id_opt = options
                                 .working_directory
-                                .as_deref()
-                                .and_then(|cwd| resolve_dir_rule(&self.config.dir_rules, cwd));
+                                .clone()
+                                .or_else(|| std::env::current_dir().ok())
+                                .and_then(|cwd| resolve_dir_rule(&self.config.dir_rules, &cwd));
 
                             // A rule's title outranks the profile's, and
                             // effective_appearance already layers the two, so
@@ -2737,6 +2784,7 @@ impl Application for App {
             dir_rule_accent_picker: dir_rule_color_picker(None),
             dir_rule_accent_before: None,
             applied_accent: None,
+            published_presence: None,
             themes: HashMap::new(),
             context_page: ContextPage::Settings,
             dialog_opt: None,
