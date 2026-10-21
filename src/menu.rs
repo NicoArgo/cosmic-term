@@ -38,6 +38,8 @@ pub fn context_menu<'a>(
     // Whether this terminal's folder already has a rule, so the menu can offer
     // removing it only when there is something to remove.
     has_dir_rule: bool,
+    // POP Flow: the terminal stands inside a git repository, below its root.
+    in_repo: bool,
 ) -> Element<'a, Message> {
     let find_key = |action: &Action| -> String {
         for (key_bind, key_action) in key_binds {
@@ -113,8 +115,14 @@ pub fn context_menu<'a>(
     rows.extend([
         Element::from(divider::horizontal::light()),
         Element::from(menu_item(fl!("new-tab"), Action::TabNew)),
-        Element::from(menu_item(fl!("menu-settings"), Action::Settings)),
     ]);
+    if in_repo {
+        rows.push(Element::from(menu_item(
+            fl!("tab-new-at-repo-root"),
+            Action::TabNewAtRepoRoot,
+        )));
+    }
+    rows.push(Element::from(menu_item(fl!("menu-settings"), Action::Settings)));
     #[cfg(feature = "password_manager")]
     {
         rows.push(Element::from(menu_item(

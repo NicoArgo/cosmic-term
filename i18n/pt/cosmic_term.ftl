@@ -114,3 +114,4 @@ repository = Repositório
 support = Suporte
 clear-scrollback = Limpar scrollback
 cancel = Cancelar
+tab-new-at-repo-root = Novo separador na raiz do repositório

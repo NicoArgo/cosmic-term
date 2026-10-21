@@ -475,6 +475,9 @@ pub enum Action {
     TabActivate8,
     TabClose,
     TabNew,
+    /// POP Flow: a new tab at the root of the git repository this terminal
+    /// is in.
+    TabNewAtRepoRoot,
     TabNewNoProfile,
     TabNext,
     TabPrev,
@@ -531,6 +534,7 @@ impl Action {
             Self::TabActivate8 => Message::TabActivateJump(8),
             Self::TabClose => Message::TabClose(entity_opt),
             Self::TabNew => Message::TabNew,
+            Self::TabNewAtRepoRoot => Message::TabNewAtRepoRoot(entity_opt),
             Self::TabNewNoProfile => Message::TabNewNoProfile,
             Self::TabNext => Message::TabNext,
             Self::TabPrev => Message::TabPrev,
@@ -664,6 +668,7 @@ pub enum Message {
     TabContextAction(segmented_button::Entity, Action),
     TabContextMenu(pane_grid::Pane, Option<MenuState>),
     TabNew,
+    TabNewAtRepoRoot(Option<segmented_button::Entity>),
     TabNewNoProfile,
     TabNext,
     TabPrev,
@@ -1227,6 +1232,14 @@ impl App {
     fn terminal_has_dir_rule(&self, entity_opt: Option<segmented_button::Entity>) -> bool {
         self.terminal_working_directory(entity_opt)
             .is_some_and(|cwd| self.config.dir_rule_for_exact_path(&cwd).is_some())
+    }
+
+    /// POP Flow: the root of the git repository a terminal is in, when that is
+    /// somewhere other than where it already stands.
+    fn terminal_repo_root(&self, entity_opt: Option<segmented_button::Entity>) -> Option<PathBuf> {
+        let cwd = self.terminal_working_directory(entity_opt)?;
+        let root = cwd.ancestors().find(|d| d.join(".git").exists())?;
+        (root != cwd).then(|| root.to_path_buf())
     }
 
     /// The working directory of a terminal, for the "here" actions and for
@@ -4074,6 +4087,20 @@ impl Application for App {
                     self.config.tab_new_inherit_working_directory,
                 );
             }
+            Message::TabNewAtRepoRoot(entity_opt) => {
+                if let Some(root) = self.terminal_repo_root(entity_opt) {
+                    // Startup options are what a new terminal reads first, over
+                    // both the profile's folder and the inherited one.
+                    let mut options = self.startup_options.take().unwrap_or_default();
+                    options.working_directory = Some(root);
+                    self.startup_options = Some(options);
+                    return self.create_and_focus_new_terminal(
+                        self.pane_model.focused(),
+                        self.get_default_profile(),
+                        false,
+                    );
+                }
+            }
             Message::TabNewNoProfile => {
                 return self.create_and_focus_new_terminal(
                     self.pane_model.focused(),
@@ -4509,6 +4536,7 @@ impl Application for App {
                     entity,
                     link.clone(),
                     self.terminal_has_dir_rule(Some(entity)),
+                    self.terminal_repo_root(Some(entity)).is_some(),
                 ),
                 autosize_id.clone(),
             )
@@ -4638,6 +4666,7 @@ impl Application for App {
                                     popup_entity,
                                     link.clone(),
                                     self.terminal_has_dir_rule(Some(popup_entity)),
+                                    self.terminal_repo_root(Some(popup_entity)).is_some(),
                                 ))
                                 .position(widget::popover::Position::Point(point));
                             popover.into()
