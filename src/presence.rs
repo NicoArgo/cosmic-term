@@ -26,6 +26,9 @@ pub struct Presence {
     pub name: Option<String>,
     /// The folder rule's color, same condition.
     pub accent: Option<HexColor>,
+    /// The folder the active tab stands in, so the panel can open another
+    /// terminal there ("Duplicar terminal" on a dot).
+    pub cwd: Option<PathBuf>,
 }
 
 impl Presence {
@@ -37,6 +40,13 @@ impl Presence {
         }
         if let Some(accent) = self.accent {
             text.push_str(&format!("accent={}\n", accent.display_rgb()));
+        }
+        // Left out rather than flattened: a folder name with a newline in it,
+        // flattened, would name a folder that does not exist.
+        if let Some(cwd) = self.cwd.as_ref().and_then(|cwd| cwd.to_str())
+            && !cwd.contains(['\n', '\r'])
+        {
+            text.push_str(&format!("cwd={cwd}\n"));
         }
         text
     }
@@ -87,11 +97,23 @@ mod tests {
             title: "POP FLOW — claude — COSMIC Terminal".into(),
             name: Some("POP FLOW".into()),
             accent: Some(HexColor::rgb(0x48, 0xb9, 0xc7)),
+            cwd: Some("/home/nico/Área de trabalho/Pop Flow".into()),
         };
         assert_eq!(
             ruled.to_text(),
-            "title=POP FLOW — claude — COSMIC Terminal\nname=POP FLOW\naccent=#48B9C7\n"
+            "title=POP FLOW — claude — COSMIC Terminal\nname=POP FLOW\naccent=#48B9C7\n\
+             cwd=/home/nico/Área de trabalho/Pop Flow\n"
         );
+    }
+
+    #[test]
+    fn a_folder_with_a_newline_is_left_out() {
+        let odd = Presence {
+            title: "t".into(),
+            cwd: Some("/tmp/a\nb".into()),
+            ..Presence::default()
+        };
+        assert_eq!(odd.to_text(), "title=t\n");
     }
 
     #[test]

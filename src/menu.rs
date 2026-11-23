@@ -55,6 +55,7 @@ pub fn context_menu(
 
     let mut items = vec![
         item(fl!("new-tab"), Action::TabNew),
+        item(fl!("window-duplicate"), Action::WindowDuplicate),
     ];
     if in_repo {
         items.push(item(fl!("tab-new-at-repo-root"), Action::TabNewAtRepoRoot));

@@ -178,4 +178,5 @@ copy-link = Copiar link
 tab-new-inherit-working-directory = Novas abas e janelas usam o diretório atual
 tab-new-inherit-working-directory-description = Abrir novas abas e janelas no diretório de trabalho da aba ativa
 tab-new-at-repo-root = Nova aba na raiz do repositório
+window-duplicate = Duplicar terminal
 show-pane-borders = Mostrar bordas do quadro

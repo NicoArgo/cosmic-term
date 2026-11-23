@@ -84,6 +84,7 @@ mod terminal_box;
 #[cfg(feature = "password_manager")]
 mod password_manager;
 mod presence;
+mod rule_marks;
 mod terminal_theme;
 
 mod dnd;
@@ -148,6 +149,35 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 eprintln!("Missing argument for {arg_str}");
                 process::exit(1);
+            }
+            Some(arg_str @ "--move-rules") => {
+                // The file manager moved a folder: its rules, and those of the
+                // folders inside it, go along.
+                let (Some(from), Some(to)) =
+                    (raw_args.next_os(&mut cursor), raw_args.next_os(&mut cursor))
+                else {
+                    eprintln!("{arg_str} needs the old and the new folder");
+                    process::exit(1);
+                };
+                let from = absolute_dir(Path::new(&from));
+                let to = absolute_dir(Path::new(&to));
+                if let Err(err) = edit_dir_rules_on_disk(|config| {
+                    rule_marks::move_rules(&mut config.dir_rules, &from, &to);
+                }) {
+                    eprintln!("{err}");
+                    process::exit(1);
+                }
+                return Ok(());
+            }
+            Some("--repair-rules") => {
+                let apply = raw_args
+                    .next_os(&mut cursor)
+                    .is_some_and(|opt| opt == "--apply");
+                if let Err(err) = repair_rules(apply) {
+                    eprintln!("{err}");
+                    process::exit(1);
+                }
+                return Ok(());
             }
             Some(arg_str @ ("--set-rule" | "--remove-rule")) => {
                 // Same reasoning as `--resolve-rule`: the file manager asks this
@@ -322,7 +352,11 @@ Options:
   --set-rule <dir> [--name <text>] [--accent <#rrggbb>] [--subdirs]
                                   Give a folder a name and color (edits its rule,
                                   or creates one), then exit
-  --remove-rule <dir>             Remove the rule set on that folder, then exit"#
+  --remove-rule <dir>             Remove the rule set on that folder, then exit
+  --move-rules <old> <new>        A folder moved: its rules (and those of the
+                                  folders inside it) follow it, then exit
+  --repair-rules [--apply]        Rules whose folder is gone: print what would
+                                  be moved or switched off; --apply does it"#
     );
 }
 
@@ -400,7 +434,65 @@ fn edit_dir_rules_on_disk(edit: impl FnOnce(&mut Config)) -> Result<(), String> 
     edit(&mut config);
     handler
         .set("dir_rules", &config.dir_rules)
-        .map_err(|err| format!("failed to save folder rules: {err}"))
+        .map_err(|err| format!("failed to save folder rules: {err}"))?;
+    rule_marks::mark_all(&config.dir_rules);
+    Ok(())
+}
+
+/// `--repair-rules [--apply]`: rules whose folder is gone. A folder of the
+/// same name that exists in exactly one place under the home, with no rule of
+/// its own, gets the rule; the rest are switched off, never deleted. Without
+/// `--apply` it only prints the plan.
+fn repair_rules(apply: bool) -> Result<(), String> {
+    let handler = cosmic_config::Config::new(App::APP_ID, CONFIG_VERSION)
+        .map_err(|err| format!("failed to open the terminal config: {err}"))?;
+    let rules: BTreeMap<config::DirRuleId, config::DirRule> = handler
+        .get_local("dir_rules")
+        .map_err(|err| format!("not repairing unreadable folder rules: {err}"))?;
+    let names: Vec<String> = rules
+        .values()
+        .filter(|rule| rule.absolute_path().is_some_and(|path| !path.exists()))
+        .filter_map(config::DirRule::folder_name)
+        .collect();
+    let home = env::home_dir().ok_or("no home folder")?;
+    let (marked, candidates) = rule_marks::scan_candidates(&home, &names, 6);
+    let plan = rule_marks::plan_repairs(&rules, &marked, &candidates, Path::exists);
+    if plan.is_empty() {
+        println!("ok: every rule points at a folder that exists");
+        return Ok(());
+    }
+    for (_, from, repair) in &plan {
+        match repair {
+            rule_marks::Repair::Move(to) => {
+                println!("mover     {}
+       ->  {}", from.display(), to.display())
+            }
+            rule_marks::Repair::Disable => println!("desligar  {}", from.display()),
+        }
+    }
+    if !apply {
+        println!("\n(nada mudou; rode com --apply para aplicar)");
+        return Ok(());
+    }
+    edit_dir_rules_on_disk(|config| {
+        // Rule by rule, by id: each line of the plan was decided for one rule,
+        // and moving a parent's subtree along would redo its children's lines.
+        for (id, _, repair) in &plan {
+            let Some(rule) = config.dir_rules.get_mut(id) else {
+                continue;
+            };
+            match repair {
+                rule_marks::Repair::Move(to) => {
+                    if let Some(to) = to.to_str() {
+                        rule.path = to.to_string();
+                    }
+                }
+                rule_marks::Repair::Disable => rule.enabled = false,
+            }
+        }
+    })?;
+    println!("\nok: {} regra(s) ajustada(s)", plan.len());
+    Ok(())
 }
 
 /// Look up a directory's rule and render it as shell assignments.
@@ -478,6 +570,8 @@ pub enum Action {
     /// POP Flow: a new tab at the root of the git repository this terminal
     /// is in.
     TabNewAtRepoRoot,
+    /// POP Flow: a new window in the folder this terminal stands in.
+    WindowDuplicate,
     TabNewNoProfile,
     TabNext,
     TabPrev,
@@ -535,6 +629,7 @@ impl Action {
             Self::TabClose => Message::TabClose(entity_opt),
             Self::TabNew => Message::TabNew,
             Self::TabNewAtRepoRoot => Message::TabNewAtRepoRoot(entity_opt),
+            Self::WindowDuplicate => Message::WindowDuplicate(entity_opt),
             Self::TabNewNoProfile => Message::TabNewNoProfile,
             Self::TabNext => Message::TabNext,
             Self::TabPrev => Message::TabPrev,
@@ -669,6 +764,7 @@ pub enum Message {
     TabContextMenu(pane_grid::Pane, Option<MenuState>),
     TabNew,
     TabNewAtRepoRoot(Option<segmented_button::Entity>),
+    WindowDuplicate(Option<segmented_button::Entity>),
     TabNewNoProfile,
     TabNext,
     TabPrev,
@@ -1124,6 +1220,20 @@ impl App {
         {
             log::error!("failed to save config: {}", err);
         }
+        rule_marks::mark_all(&self.config.dir_rules);
+    }
+
+    /// The folder `from` was moved to `to` by something that did not say so:
+    /// its rules go with it, and the folder gets a mark for its new place.
+    fn heal_moved_rule(&mut self, from: PathBuf, to: PathBuf) -> Task<Message> {
+        let moved = rule_marks::move_rules(&mut self.config.dir_rules, &from, &to);
+        log::info!(
+            "folder moved from {} to {}: {moved} rule(s) follow it",
+            from.display(),
+            to.display()
+        );
+        self.persist_dir_rules();
+        self.apply_dir_rules()
     }
 
     /// The rule's color, or `None` when the folder inherits.
@@ -1324,10 +1434,14 @@ impl App {
     /// title, tab or folder rule already goes through.
     fn publish_presence(&mut self, title: String) {
         let (name, accent) = self.active_dir_identity();
+        // The bash prompt puts the folder in the title, so a `cd` comes
+        // through here too and this stays current.
+        let cwd = self.terminal_working_directory(None);
         let presence = presence::Presence {
             title,
             name,
             accent,
+            cwd,
         };
         if self.published_presence.as_ref() == Some(&presence) {
             return;
@@ -2405,6 +2519,23 @@ impl App {
 
             // Moving within the same rule's territory must not restyle: it
             // would be pure churn, and any flicker would be on every prompt.
+            // No rule here, but the folder may be one that was moved by
+            // something other than the file manager: its mark says where its
+            // rule still thinks it is.
+            if dir_rule_id_opt.is_none()
+                && let Some((from, to)) = terminal.polled_working_directory().and_then(|cwd| {
+                    rule_marks::find_moved(
+                        &self.config.dir_rules,
+                        cwd,
+                        rule_marks::read_mark,
+                        Path::exists,
+                    )
+                })
+            {
+                drop(terminal);
+                return self.heal_moved_rule(from, to);
+            }
+
             if dir_rule_id_opt == terminal.dir_rule_id_opt {
                 return Task::none();
             }
@@ -4276,6 +4407,24 @@ impl Application for App {
                         Err(err) => {
                             log::error!("failed to execute {:?}: {}", exe, err);
                         }
+                    }
+                }
+                Err(err) => {
+                    log::error!("failed to get current executable path: {}", err);
+                }
+            },
+            // Same as "New window", but always in this terminal's folder,
+            // whatever the "inherit the folder" setting says: that is the
+            // whole point of duplicating.
+            Message::WindowDuplicate(entity_opt) => match env::current_exe() {
+                Ok(exe) => {
+                    let mut command = process::Command::new(&exe);
+                    if let Some(dir) = self.terminal_working_directory(entity_opt) {
+                        command.arg("--working-directory");
+                        command.arg(dir);
+                    }
+                    if let Err(err) = command.spawn() {
+                        log::error!("failed to execute {:?}: {}", exe, err);
                     }
                 }
                 Err(err) => {

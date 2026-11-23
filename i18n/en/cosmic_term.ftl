@@ -172,3 +172,4 @@ add-password = Add Password
 password-input = Password
 password-input-description = Description
 tab-new-at-repo-root = New tab at repository root
+window-duplicate = Duplicate terminal

@@ -11,6 +11,8 @@ alacritty_terminal = "0.25.1"
 hex_color = { version = "3", features = ["serde"] }
 indexmap = "2"
 log = "0.4"
+# POP Flow: the mark that lets a folder's rule follow it (src/rule_marks.rs).
+xattr = "1"
 open = "5.3.2"
 paste = "1.0"
 regex = "1"
