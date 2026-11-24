@@ -170,10 +170,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                 return Ok(());
             }
             Some("--repair-rules") => {
-                let apply = raw_args
-                    .next_os(&mut cursor)
-                    .is_some_and(|opt| opt == "--apply");
-                if let Err(err) = repair_rules(apply) {
+                let mut apply = false;
+                let mut remove = false;
+                while let Some(opt) = raw_args.next_os(&mut cursor) {
+                    match opt.to_str() {
+                        Some("--apply") => apply = true,
+                        Some("--remove") => remove = true,
+                        _ => {
+                            eprintln!("Unknown option for --repair-rules: {opt:?}");
+                            process::exit(1);
+                        }
+                    }
+                }
+                if let Err(err) = repair_rules(apply, remove) {
                     eprintln!("{err}");
                     process::exit(1);
                 }
@@ -355,8 +364,10 @@ Options:
   --remove-rule <dir>             Remove the rule set on that folder, then exit
   --move-rules <old> <new>        A folder moved: its rules (and those of the
                                   folders inside it) follow it, then exit
-  --repair-rules [--apply]        Rules whose folder is gone: print what would
-                                  be moved or switched off; --apply does it"#
+  --repair-rules [--apply] [--remove]
+                                  Rules whose folder is gone: print what would
+                                  be moved or switched off; --apply does it;
+                                  --remove deletes the ones with no folder found"#
     );
 }
 
@@ -443,7 +454,7 @@ fn edit_dir_rules_on_disk(edit: impl FnOnce(&mut Config)) -> Result<(), String> 
 /// same name that exists in exactly one place under the home, with no rule of
 /// its own, gets the rule; the rest are switched off, never deleted. Without
 /// `--apply` it only prints the plan.
-fn repair_rules(apply: bool) -> Result<(), String> {
+fn repair_rules(apply: bool, remove: bool) -> Result<(), String> {
     let handler = cosmic_config::Config::new(App::APP_ID, CONFIG_VERSION)
         .map_err(|err| format!("failed to open the terminal config: {err}"))?;
     let rules: BTreeMap<config::DirRuleId, config::DirRule> = handler
@@ -467,6 +478,7 @@ fn repair_rules(apply: bool) -> Result<(), String> {
                 println!("mover     {}
        ->  {}", from.display(), to.display())
             }
+            rule_marks::Repair::Disable if remove => println!("apagar    {}", from.display()),
             rule_marks::Repair::Disable => println!("desligar  {}", from.display()),
         }
     }
@@ -478,6 +490,10 @@ fn repair_rules(apply: bool) -> Result<(), String> {
         // Rule by rule, by id: each line of the plan was decided for one rule,
         // and moving a parent's subtree along would redo its children's lines.
         for (id, _, repair) in &plan {
+            if remove && *repair == rule_marks::Repair::Disable {
+                config.dir_rules.remove(id);
+                continue;
+            }
             let Some(rule) = config.dir_rules.get_mut(id) else {
                 continue;
             };
